@@ -1,8 +1,9 @@
 name: Windows release
 
 # Builds yara.exe on the self-hosted Windows 11 VM and attaches it to a
-# GitHub release. The VM needs Rust (rustup stable, MSVC) preinstalled.
-# Register the VM with the label "windows" (see repo workflow docs).
+# GitHub release. The VM only needs Rust (rustup stable, MSVC) preinstalled;
+# release uploads use the GitHub REST API via curl (built into Windows).
+# Register the VM with the label "windows".
 #
 # Two ways to run it:
 #   - Push a semver tag (e.g. 1.2.0 or v1.2.0): creates/extends that release.
@@ -54,18 +55,36 @@ jobs:
           } else {
             throw "No release tag: push a tag, or provide release_tag."
           }
-          $exe = "target\release\yara.exe"
+          $api = 'https://api.github.com'
+          $repo = $env:GITHUB_REPOSITORY
+          $auth = "token $($env:GH_TOKEN)"
+          $exe = 'target\release\yara.exe'
           if (-not (Test-Path $exe)) {
             throw "Build did not produce $exe"
           }
-          gh release view $tag --json url 2>$null | Out-Null
-          $exists = ($LASTEXITCODE -eq 0)
-          if ($exists) {
-            gh release upload $tag $exe --clobber
-            Write-Host "Attached $exe to existing release $tag"
-          } else {
-            gh release create $tag $exe `
-              --title "yara $tag (Windows)" `
-              --notes "Built on a self-hosted Windows 11 runner."
-            Write-Host "Created release $tag with $exe"
+          $code = curl.exe -s -o NUL -w '%{http_code}' `
+            -H "Authorization: $auth" "$api/repos/$repo/releases/tags/$tag"
+          if ($code -ne '200') {
+            $payload = @{
+              tag_name = $tag
+              name = "yara $tag (Windows)"
+              body = 'Built on a self-hosted Windows 11 runner.'
+            } | ConvertTo-Json
+            curl.exe -s -X POST -H "Authorization: $auth" `
+              -H 'Content-Type: application/json' --data $payload `
+              "$api/repos/$repo/releases" | Out-Null
+            Write-Host "Created release $tag"
           }
+          $rel = (curl.exe -s -H "Authorization: $auth" `
+            "$api/repos/$repo/releases/tags/$tag") | ConvertFrom-Json
+          foreach ($asset in $rel.assets) {
+            if ($asset.name -eq 'yara.exe') {
+              curl.exe -s -X DELETE -H "Authorization: $auth" `
+                "$api/repos/$repo/releases/assets/$($asset.id)" | Out-Null
+            }
+          }
+          curl.exe -s -X POST -H "Authorization: $auth" `
+            -H 'Content-Type: application/octet-stream' `
+            --data-binary "@$exe" `
+            "$($rel.url)/assets?name=yara.exe&label=Windows" | Out-Null
+          Write-Host "Attached yara.exe to release $tag"
