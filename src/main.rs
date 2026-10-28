@@ -1,8 +1,9 @@
 use std::io::{Read, BufReader, Write};
 use std::path::{PathBuf, Path};
 use std::fs;
+#[cfg(windows)]
 use std::process::Command;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::{thread, time::{Duration, Instant}};
 
 use serde_json::{Value, Map};
@@ -17,7 +18,7 @@ mod data;
 
 use regen::regen_modified_workflows;
 use fix::{generate_yara_prompts, fix_workflows_in_folders, fix_workflow_in_file};
-use data::YaraPrompt;
+use data::{YaraPrompt, hash_nodemap};
 
 const STATUS: &str = "\x1b[36mstatus\x1b[0m:// ";
 
@@ -36,10 +37,6 @@ struct PromptInfo {
     models: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Prompt {
-    prompt: Value,
-}
 #[derive(PartialEq)]
 enum SaveQueue {
     All,
@@ -113,12 +110,12 @@ fn main() {
                     match arg.as_str() {
                         "-wr" => {
                             if let Some(arg) = args.next() {
-                                save_queue(arg, SaveQueue::All, ip_port);
+                                save_queue(arg, SaveQueue::All, ip_port, &workflow_storage);
                             } 
                             else { print_help(); }
                         }
                         _ => {
-                            save_queue(arg, SaveQueue::Pending, ip_port);
+                            save_queue(arg, SaveQueue::Pending, ip_port, &workflow_storage);
                         }
                     }
                 } 
@@ -259,21 +256,44 @@ fn main() {
 
 
 
-fn save_queue(arg: String, cmd: SaveQueue, ip_port: String) {
+fn save_queue(arg: String, cmd: SaveQueue, ip_port: String, workflow_storage: &WorkflowStorage) {
     let queue_data = get_queue(&ip_port);
 
     let mut prompts: Vec<YaraPrompt> = Vec::new();
     let mut successes = 0;
     let mut failures = 0;
 
+    // The ComfyUI frontend sends the workflow metadata alongside each prompt. As a
+    // fallback for prompts queued without metadata (e.g. by yara itself), the local
+    // workflow storage is searched by node-map hash.
+    let get_workflow = |p: &Value| -> Option<Value> {
+        let wf = p.get(3)
+            .and_then(|extra| extra.as_object())
+            .and_then(|extra| extra.get("extra_pnginfo"))
+            .and_then(|e_p_i| e_p_i.as_object())
+            .and_then(|e_p_i| e_p_i.get("workflow"));
+        if let Some(wf) = wf {
+            return wf.as_object().map(|x| x.clone().into());
+        }
+        if let Some(nodemap) = p.get(2).and_then(|n| n.as_object()) {
+            let mut nodemap = nodemap.clone();
+            for value in nodemap.values_mut() {
+                if let Some(inputs) = value.get_mut("inputs").and_then(|i| i.as_object_mut()) {
+                    inputs.remove("title");
+                }
+            }
+            let hash = hash_nodemap(&nodemap);
+            return workflow_storage.workflows.get(&hash).map(|x| x.clone());
+        }
+        None
+    };
+
     if cmd == SaveQueue::All {
         if let Some(x) = queue_data["queue_running"].as_array() {
             for p in x {
-                let prompt = p[2].as_object().unwrap().clone();
-                let pnginfo = p[3].as_object().unwrap().get("extra_pnginfo");
-                match pnginfo {
-                    Some(wf) => {
-                        let workflow = wf.as_object().unwrap().get("workflow").unwrap().clone();
+                let Some(prompt) = p[2].as_object().cloned() else { failures += 1; continue; };
+                match get_workflow(p) {
+                    Some(workflow) => {
                         prompts.push(YaraPrompt::new(prompt, workflow, &ip_port));
                         successes += 1;
                     }
@@ -289,11 +309,9 @@ fn save_queue(arg: String, cmd: SaveQueue, ip_port: String) {
     let mut ordered_prompts: Vec<(i64, YaraPrompt)> = Vec::new();
     if let Some(x) = queue_data["queue_pending"].as_array() {
         for p in x {
-            let prompt = p[2].as_object().unwrap().clone();
-            let pnginfo = p[3].as_object().unwrap().get("extra_pnginfo");
-            match pnginfo {
-                Some(wf) => {
-                    let workflow = wf.as_object().unwrap().get("workflow").unwrap().clone();
+            let Some(prompt) = p[2].as_object().cloned() else { failures += 1; continue; };
+            match get_workflow(p) {
+                Some(workflow) => {
                     ordered_prompts.push((
                         p[0].as_i64().unwrap(), 
                         YaraPrompt::new(prompt, workflow, &ip_port)
@@ -327,13 +345,15 @@ fn cancel_generations(prompt_numbers: Vec<i64>, ip_port: String) {
     let queue_data = get_queue(&ip_port);
 
     let mut ids: Vec<String> = Vec::new();
-    let mut interrupt_active_gen = false;
+    let mut running_ids: Vec<String> = Vec::new();
 
     if let Some(x) = queue_data["queue_running"].as_array() {
         for p in x {
             if prompt_numbers.contains(&p[0].as_i64().unwrap()) {
                 println!("  [\x1b[32m{}\x1b[0m] - {}", p[0].as_i64().unwrap(), p[1].to_string());
-                interrupt_active_gen = true;
+                if let Some(id) = p[1].as_str() {
+                    running_ids.push(id.to_string());
+                }
             }
         }
     }
@@ -347,17 +367,26 @@ fn cancel_generations(prompt_numbers: Vec<i64>, ip_port: String) {
         }
     }
 
+    if ids.is_empty() && running_ids.is_empty() {
+        println!("No matching prompts found in the queue.");
+        return;
+    }
 
+    if !ids.is_empty() {
+        let data = serde_json::to_string(&RemovePrompts{ delete: ids }).unwrap();
+        let response = isahc::post(ip_port.to_string() + &"queue", data).unwrap();
 
-    let data = serde_json::to_string(&RemovePrompts{ delete: ids }).unwrap();
-    let response = isahc::post(ip_port.to_string() + &"queue", data).unwrap();
+        println!("Queue-Clearing Status: {:?}", response.status());
+        assert!(response.status() == 200);
+    }
 
-    println!("Queue-Clearing Status: {:?}", response.status());
-    assert!(response.status() == 200);
-
-    if interrupt_active_gen {
-        let response = isahc::post(ip_port + &"interrupt", "x").unwrap();
-        println!("Active generation interrupted: {:?}", response.status());
+    for id in running_ids {
+        // Modern ComfyUI interrupts only the specified prompt; older versions
+        // ignore the request body and interrupt globally.
+        let data = format!(r#"{{"prompt_id": "{id}"}}"#);
+        let response = isahc::post(ip_port.to_string() + &"interrupt", data).unwrap();
+        println!("Interrupted running prompt {id}: {:?}", response.status());
+        assert!(response.status() == 200);
     }
 }
 
@@ -390,8 +419,9 @@ fn examine_queue(ip_port: String) {
 
     if let Some(x) = queue_date["queue_pending"].as_array() {
         for p in x {
-            let pinfo = get_prompt_info(p);
-            ordered_prompts.push((p[0].as_i64().unwrap(), pinfo));
+            if let Some(pinfo) = get_prompt_info(p) {
+                ordered_prompts.push((pinfo.id, pinfo));
+            }
         }
     }
     ordered_prompts.sort_by(|a, b| b.0.cmp(&a.0));
@@ -410,7 +440,7 @@ fn examine_queue(ip_port: String) {
 
     if let Some(x) = queue_date["queue_running"].as_array() {
         for p in x {
-            let pinfo = get_prompt_info(p);
+            let Some(pinfo) = get_prompt_info(p) else { continue; };
             print!("\x1b[32mRunning {}: \x1b[0m", pinfo.id);
             for model in pinfo.models {
                 print!("\x1b[32m{model}, \x1b[0m");
@@ -424,26 +454,43 @@ fn examine_queue(ip_port: String) {
 }
 
 
-fn get_prompt_info(p: &Value) -> PromptInfo {
-    let queue_id = p[0].as_i64().unwrap();
-    let nodes = p[2].as_object().unwrap();
+// Node references in prompt maps are usually numeric strings ("5"), but can
+// also be numbers depending on the client. Accept both.
+fn node_ref_id(v: &Value) -> Option<u64> {
+    match v {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+
+fn get_prompt_info(p: &Value) -> Option<PromptInfo> {
+    let queue_id = p[0].as_i64()?;
+    let nodes = p[2].as_object()?;
 
     // println!("Queue ID: {queue_id}");
 
     let mut nodemap: HashMap<u64, Value> = HashMap::new();
-    let mut sampler_id: u64 = 0;
+    let mut sampler_id: Option<u64> = None;
     for n in nodes {
         if (n.1["class_type"] == "KSampler") | (n.1["class_type"] == "KSamplerAdvanced") | (n.1["class_type"] == "SamplerCustom") {
-            sampler_id = n.0.to_string().parse::<u64>().unwrap();
+            sampler_id = n.0.to_string().parse::<u64>().ok();
         }
-        nodemap.insert(n.0.to_string().parse::<u64>().unwrap(), n.1.clone());
+        if let Ok(id) = n.0.to_string().parse::<u64>() {
+            nodemap.insert(id, n.1.clone());
+        }
     }
+    // Prompts with no sampler node (e.g. from custom nodes) have nothing to show.
+    let sampler_id = sampler_id?;
 
     // Get models (lora -> ... -> lora -> model)
     let mut curr_node_id: u64 = sampler_id;
+    let mut visited: HashSet<u64> = HashSet::new();
     let mut models: Vec<String> = Vec::new();
     loop {
-        let curr_node = nodemap.get(&curr_node_id).unwrap();
+        if !visited.insert(curr_node_id) { break; }
+        let Some(curr_node) = nodemap.get(&curr_node_id) else { break; };
         if curr_node["class_type"] == "LoraLoader" {
             let mut name = curr_node["inputs"]["lora_name"].to_string();
             if name.contains(".safetensors") {
@@ -461,45 +508,43 @@ fn get_prompt_info(p: &Value) -> PromptInfo {
             models.push(name);
         }
 
-        if let Some(input_model_id) = curr_node["inputs"].get("model") {
-            curr_node_id = input_model_id[0].as_u64().unwrap();
-        } 
-        else {
-            break;
+        match curr_node["inputs"].get("model").and_then(|m| node_ref_id(&m[0])) {
+            Some(id) => curr_node_id = id,
+            None => break,
         }
     }
     // println!("models: {models:?}");
 
     // Get positive prompt
     let mut curr_node_id: u64 = sampler_id;
+    let mut visited: HashSet<u64> = HashSet::new();
     let mut p_prompt = String::new();
     // TO-DO: Refactor this section
     loop {
-        let curr_node = nodemap.get(&curr_node_id).unwrap();
+        if !visited.insert(curr_node_id) { break; }
+        let Some(curr_node) = nodemap.get(&curr_node_id) else { break; };
         if curr_node["class_type"] == "PromptText" {
             p_prompt = curr_node["inputs"]["text"].to_string();
             break;
         }
         if curr_node["class_type"] == "CLIPTextEncode" {
-            if let Some(input_node_id) = curr_node["inputs"].get("text") {
-                curr_node_id = match input_node_id[0].as_u64() {
-                    Some(x) => x,
+            if let Some(text) = curr_node["inputs"].get("text") {
+                match node_ref_id(&text[0]) {
+                    Some(id) => curr_node_id = id, // text is a link to another node
                     None => {
-                        p_prompt = curr_node["inputs"]["text"].to_string();
+                        p_prompt = text.to_string();
                         break;
                     }
                 }
             } else {
-                p_prompt = curr_node["inputs"]["text"].to_string();
                 break;
             }
         }
-
-        else if let Some(input_node_id) = curr_node["inputs"].get("positive") {
-            curr_node_id = input_node_id[0].as_u64().unwrap();
-        } 
-        else if let Some(input_node_id) = curr_node["inputs"].get("conditioning") {
-            curr_node_id = input_node_id[0].as_u64().unwrap();
+        else if let Some(id) = curr_node["inputs"].get("positive").and_then(|m| node_ref_id(&m[0])) {
+            curr_node_id = id;
+        }
+        else if let Some(id) = curr_node["inputs"].get("conditioning").and_then(|m| node_ref_id(&m[0])) {
+            curr_node_id = id;
         }
         else {
             break;
@@ -509,11 +554,11 @@ fn get_prompt_info(p: &Value) -> PromptInfo {
     p_prompt = p_prompt.replace("/n", " ");
     // println!("positive prompt: {p_prompt:#?}");
 
-    PromptInfo {
+    Some(PromptInfo {
         id: queue_id,
         positive: p_prompt,
         models: models,
-    }
+    })
 
 }
 
@@ -585,7 +630,7 @@ fn image_generation_info() -> ImageGenInteractive {
 
     // open image as bytes, turn to string
     let mut buffer: Vec<u8> = Vec::new();
-    let mut file = match fs::File::open(path) {
+    let mut file = match fs::File::open(path.as_path()) {
         Ok(x) => x,
         Err(e) => { println!("Failed to open file: {e}");  return ImageGenInteractive::Repeat; }
     };
@@ -594,7 +639,12 @@ fn image_generation_info() -> ImageGenInteractive {
 
 
     // get prompt json
-    let text = &text.split("tEXtprompt\0{").map(|x| x.to_string()).collect::<Vec<String>>()[1];
+    let segments: Vec<String> = text.split("tEXtprompt\0{").map(|x| x.to_string()).collect();
+    if segments.len() < 2 {
+        println!("\x1b[31merror\x1b[0m:// could not find embedded generation data in {path:?}");
+        return ImageGenInteractive::Repeat;
+    }
+    let text = &segments[1];
     let mut brackets = 1;
     let mut prompt_string = String::from("{");
     for c in text.chars() {
@@ -729,11 +779,7 @@ fn image_generation_info() -> ImageGenInteractive {
 
 
 fn get_queue(ip_port: &str) -> Value {
-    let mut response = isahc::get(ip_port.to_string() + &"queue").unwrap();
-    let mut buf = String::new();
-    response.body_mut().read_to_string(&mut buf).unwrap();
-    let json_data: Value = serde_json::from_str(&buf).unwrap();
-    json_data
+    data::fetch_json(&(ip_port.to_string() + "queue"))
 }
 
 
@@ -764,8 +810,8 @@ fn print_help() {
         yara wait                  wait until all prompts have finished
         yara preview               create a window previewing new files in the output directory
         yara image                 check embedded generation data of images
-        yara clear [PROMPT_IDS]    delete queued generations by numerical ID
-                                       e.g. 'yara clear 250 251 252'
+        yara cancel [PROMPT_IDS]   delete queued generations by numerical ID
+                                       e.g. 'yara cancel 250 251 252'
         yara config                open directory of config file
         yara cai [URLs]            download CivitAI models/loras/etc, copying relevant info to clipboard
         yara regen [FILEPATHS]     regenerate images, modifying marked nodes (more info: run 'yara help regen')

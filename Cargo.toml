@@ -1,6 +1,6 @@
 [package]
 name = "yara"
-version = "1.0.4"
+version = "1.1.0"
 edition = "2021"
 
 description = "A terminal-based companion program for ComfyUI."
@@ -8,7 +8,7 @@ license = "GPL-3.0"
 readme = "readme.md"
 keywords = ["comfyui", "ai", "stable_diffusion"]
 categories = ["command-line-utilities"]
-repository = "https://github.com/Satellile/yara"
+repository = "https://github.com/giacomoguiduzzi/yara"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

@@ -389,8 +389,7 @@ pub fn regen_modified_workflows(filepath: &PathBuf, mut comfyui_input_directory:
                 {{
                     "class_type": "LoadImage",
                     "inputs": {{
-                        "image": "{new_filename}",
-                        "upload": "image"
+                        "image": "{new_filename}"
                     }}
                 }}
                 "#)).ok()?,

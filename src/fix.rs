@@ -29,9 +29,13 @@ pub fn fix_workflows_in_folders(mut storage: &mut WorkflowStorage, workflow_file
             if path_is_png_file(path.as_path()) {
                 if let Ok(hash) = get_api_hash_from_image_file(path.as_path()) {
                     if let Some(workflow) = storage.workflows.get(&hash) {
-                        inject_workflow_into_image(&path, &workflow);
-                        remove_workflow_from_storage(&hash, workflow_file, &mut storage);
-                        println!("       Workflow has been embedded into image {:?}", path.file_name().unwrap());
+                        match inject_workflow_into_image(&path, &workflow) {
+                            Ok(()) => {
+                                remove_workflow_from_storage(&hash, workflow_file, &mut storage);
+                                println!("       Workflow has been embedded into image {:?}", path.file_name().unwrap());
+                            }
+                            Err(err) => println!("\x1b[31merror\x1b[0m:// failed to embed workflow into {:?}: {err}", path.file_name().unwrap()),
+                        }
                     }
                 } else { println!("Failed to get api info and hash from file: {:?}", path.file_name().unwrap()); }
             }
@@ -42,11 +46,21 @@ pub fn fix_workflows_in_folders(mut storage: &mut WorkflowStorage, workflow_file
 
 pub fn fix_workflow_in_file(mut storage: &mut WorkflowStorage, workflow_file: &str, path: PathBuf) {
     if path_is_png_file(path.as_path()) {
-        let hash = get_api_hash_from_image_file(path.as_path()).unwrap();
-        if let Some(workflow) = storage.workflows.get(&hash) {
-            inject_workflow_into_image(&path, &workflow);
-            remove_workflow_from_storage(&hash, workflow_file, &mut storage);
-            println!("       Workflow has been embedded into image {:?}", path.file_name().unwrap());
+        match get_api_hash_from_image_file(path.as_path()) {
+            Ok(hash) => {
+                if let Some(workflow) = storage.workflows.get(&hash) {
+                    match inject_workflow_into_image(&path, &workflow) {
+                        Ok(()) => {
+                            remove_workflow_from_storage(&hash, workflow_file, &mut storage);
+                            println!("       Workflow has been embedded into image {:?}", path.file_name().unwrap());
+                        }
+                        Err(err) => println!("\x1b[31merror\x1b[0m:// failed to embed workflow into {:?}: {err}", path.file_name().unwrap()),
+                    }
+                } else {
+                    println!("\x1b[33mwarning\x1b[0m:// no stored workflow matches this image ({}); nothing to embed.", path.display());
+                }
+            }
+            Err(_) => println!("\x1b[31merror\x1b[0m:// failed to get api info and hash from file: {:?}", path.file_name().unwrap()),
         }
     }
 }
@@ -81,8 +95,10 @@ pub fn generate_yara_prompts(
 
     println!("Sending prompts to ComfyUI for generation...");
     for yara_prompt in &yara_prompts {
-        let id = yara_prompt.generate();
-        prompt_ids.insert(id, PIDStatus::Queued);
+        match yara_prompt.generate() {
+            Ok(id) => { prompt_ids.insert(id, PIDStatus::Queued); }
+            Err(err) => eprintln!("\x1b[31merror\x1b[0m:// failed to send a prompt to ComfyUI: {err}"),
+        }
     }
 
     // begin watching history to see when a prompt has finished
@@ -111,38 +127,54 @@ pub fn generate_yara_prompts(
 
             for gpid in new_history.as_object().unwrap().keys() {
                 if let Some(status) = prompt_ids.get_mut(gpid) {
-                    if status == &PIDStatus::Queued { // one of our images, finished generating.
+                        if status == &PIDStatus::Queued { // one of our images, finished generating.
 
-                        // Find out the file path
-                        let outputs = new_history.as_object().unwrap().get(gpid).unwrap().get("outputs").unwrap().as_object().unwrap();
-                        for k in outputs.keys() {
-                            let info = outputs.get(k).unwrap().as_object().unwrap().get("images").unwrap().as_array().unwrap()[0].as_object().unwrap();
-                            if info.get("type").unwrap() == "output" {
-                                let filename = info.get("filename").unwrap().as_str().unwrap();
-                                let subfolder = info.get("subfolder").unwrap().as_str().unwrap();
-                                print!("\n{STATUS}generated image needs a workflow... ");
-                                std::io::stdout().flush().unwrap();
-                                let mut path = comfyui_output_directory.clone();
-                                if subfolder != "" {
-                                    path.push(subfolder);
-                                }
-                                path.push(filename);
+                            // Find the output image file path(s)
+                            if let Some(outputs) = new_history.as_object().unwrap().get(gpid).unwrap().get("outputs").and_then(|o| o.as_object()) {
+                                for node_outputs in outputs.values() {
+                                    if let Some(images) = node_outputs.get("images").and_then(|i| i.as_array()) {
+                                        for info in images {
+                                            if info.get("type").and_then(|t| t.as_str()) != Some("output") {
+                                                continue;
+                                            }
+                                            let Some(filename) = info.get("filename").and_then(|f| f.as_str()) else { continue; };
+                                            let subfolder = info.get("subfolder").and_then(|s| s.as_str()).unwrap_or("");
+                                            print!("\n{STATUS}generated image needs a workflow... ");
+                                            std::io::stdout().flush().unwrap();
+                                            let mut path = comfyui_output_directory.clone();
+                                            if subfolder != "" {
+                                                path.push(subfolder);
+                                            }
+                                            path.push(filename);
 
-                                // Hash the API data, inject workflow if it matches
-                                let hash = get_api_hash_from_image_file(path.as_path()).unwrap();
-                                if let Some(workflow) = storage.workflows.get(&hash) {
-                                    inject_workflow_into_image(&path, &workflow);
-                                    remove_workflow_from_storage(&hash, workflow_file, &mut storage);
-                                    println!(" embedded workflow into {subfolder}/{filename}");
-                                    workflows_embedded += 1;
-                                } else {
-                                    println!("//\x1b[31m WARNING\x1b[0m // Hash doesn't match (unexpected) // hash {hash}, file {filename}");
+                                            // Hash the API data, inject workflow if it matches
+                                            match get_api_hash_from_image_file(path.as_path()) {
+                                                Ok(hash) => {
+                                                    if let Some(workflow) = storage.workflows.get(&hash) {
+                                                        match inject_workflow_into_image(&path, &workflow) {
+                                                            Ok(()) => {
+                                                                // The workflow is intentionally NOT removed from
+                                                                // storage here: a single prompt can produce several
+                                                                // images (multiple SaveImage nodes, batches > 1,
+                                                                // or regenerated variants) and they should all
+                                                                // receive the workflow.
+                                                                println!(" embedded workflow into {subfolder}/{filename}");
+                                                                workflows_embedded += 1;
+                                                            }
+                                                            Err(err) => println!("\x1b[31merror\x1b[0m:// failed to embed workflow into {subfolder}/{filename}: {err}"),
+                                                        }
+                                                    } else {
+                                                        println!("//\x1b[31m WARNING\x1b[0m // Hash doesn't match (unexpected) // hash {hash}, file {filename}");
+                                                    }
+                                                }
+                                                Err(_) => println!("\x1b[31merror\x1b[0m:// could not read embedded API data from {subfolder}/{filename}"),
+                                            }
+                                        }
+                                    }
                                 }
-                                break;
                             }
+                            *status = PIDStatus::Finished;
                         }
-                        *status = PIDStatus::Finished;
-                    }
                 }
             }
         }
@@ -160,13 +192,10 @@ fn get_api_hash_from_image_file(path: &Path) -> Result<String, std::io::Error> {
     Ok(hash)
 }
 fn get_history(ip_port: &str) -> Value {
-    let mut response = isahc::get(ip_port.to_string() + &"history").unwrap();
-    let mut buf = String::new();
-    response.body_mut().read_to_string(&mut buf).unwrap();
-    serde_json::from_str(&buf).unwrap()
+    crate::data::fetch_json(&(ip_port.to_string() + "history"))
 }
-fn inject_workflow_into_image(image_path: &PathBuf, workflow: &Value) {
-    let file = fs::File::open(image_path).unwrap();
+fn inject_workflow_into_image(image_path: &PathBuf, workflow: &Value) -> Result<(), String> {
+    let file = fs::File::open(image_path).map_err(|err| err.to_string())?;
     let mut reader = BufReader::new(file);
 
     let mut bytes: Vec<u8> = Vec::new();
@@ -174,7 +203,7 @@ fn inject_workflow_into_image(image_path: &PathBuf, workflow: &Value) {
     // look for textprompt header chars
     let mut buf = [0u8; 5];
     'search_for_marker: loop {
-        reader.read_exact(&mut buf).unwrap(); // UnexpectedEof: no header found
+        reader.read_exact(&mut buf).map_err(|_| "could not find the 'prompt' metadata chunk in the image".to_string())?;
         bytes.extend(buf);
         for i in 0..(API_DATA_MARKER.len()-4) {
             if API_DATA_MARKER[i..(i+5)] == buf {
@@ -186,7 +215,7 @@ fn inject_workflow_into_image(image_path: &PathBuf, workflow: &Value) {
     // read textprompt data
     let mut byte = [0u8; 1];
     loop {
-        reader.read_exact(&mut byte).unwrap();
+        reader.read_exact(&mut byte).map_err(|_| "unexpected end of file while reading the 'prompt' metadata chunk".to_string())?;
         bytes.extend(byte);
         if byte == [b'{'] {
             break;
@@ -194,7 +223,7 @@ fn inject_workflow_into_image(image_path: &PathBuf, workflow: &Value) {
     }
     let mut opening_bracket_count = 1;
     while opening_bracket_count > 0 {
-        reader.read_exact(&mut byte).unwrap();
+        reader.read_exact(&mut byte).map_err(|_| "unexpected end of file while reading the 'prompt' metadata chunk".to_string())?;
         bytes.extend(byte);
         match byte {
             [b'{'] => opening_bracket_count += 1,
@@ -205,7 +234,7 @@ fn inject_workflow_into_image(image_path: &PathBuf, workflow: &Value) {
 
     // read textprompt CRC bytes
     for _ in 0..4 {
-        reader.read_exact(&mut byte).unwrap();
+        reader.read_exact(&mut byte).map_err(|_| "unexpected end of file while reading the 'prompt' metadata chunk".to_string())?;
         bytes.extend(byte);
     }
 
@@ -233,7 +262,7 @@ fn inject_workflow_into_image(image_path: &PathBuf, workflow: &Value) {
 
     // Read the rest of the file
     let mut buf: Vec<u8> = Vec::new();
-    reader.read_to_end(&mut buf).unwrap();
+    reader.read_to_end(&mut buf).map_err(|err| err.to_string())?;
     bytes.extend(buf);
 
     // Write the file, overwriting previous image
@@ -241,6 +270,7 @@ fn inject_workflow_into_image(image_path: &PathBuf, workflow: &Value) {
         .write(true)
         .truncate(true)
         .open(image_path)
-        .unwrap();
-    file.write_all(&bytes).unwrap();
+        .map_err(|err| err.to_string())?;
+    file.write_all(&bytes).map_err(|err| err.to_string())?;
+    Ok(())
 }

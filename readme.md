@@ -24,13 +24,21 @@ It can:
 
 # Installing
 
-### [Direct link to download](https://github.com/Satellile/yara/releases/download/latest/yara.exe)
+### [Releases](https://github.com/giacomoguiduzzi/yara/releases)
 
-Download "yara.exe". 
-Open a terminal in the same directory/folder as "yara.exe", and run the program through the terminal by simply typing `yara`.
+Download "yara.exe" (Windows) or "yara" (Linux) from the releases page. 
+Open a terminal in the same directory/folder as the executable, and run the program by simply typing `yara`.
+
+Alternatively, build from source:
+
+    cargo build --release
+
+The binary will be in `target/release/yara`.
 
 The first time you run, you must select your ComfyUI output folder, and then a config file will automatically be created.
 You can open the folder containing the config file with the argument `yara config`, to edit it manually (most of the options are just for configuring `yara preview`).
+
+If you run into trouble connecting, check that `comfyui_address` and `comfyui_port` in the config file match your ComfyUI instance (the defaults are `127.0.0.1` and `8188`).
 
 </br></br>
 
@@ -239,6 +247,6 @@ Some of the commands can be shortened, for convenience:
 
 If you have an issue, question, or request for some feature/config option, feel free to make an issue or message me.
 
-This is developed mainly with Windows in mind. There's a Linux release, but it's missing some features (sleep mode toggles) and when I very briefly tested it, the image preview feature didn't work. I mostly use Windows and Linux downloads were a very small percentage of total downloads, so it's not something I'm prioritizing. If anybody wants to use it on Linux, feel free to make a pull request, a GitHub issue, or just send me a message so I know people are interested in it.
+This is developed mainly with Windows in mind, but this fork is built and tested on Linux as well (the sleep mode toggles are Windows-only, and print a notice on Linux).
 
-This is built for the latest ComfyUI release binary as of January 31, 2024. Future ComfyUI versions may change the API and thus break parts of this program.
+This fork is tested against ComfyUI 0.42.x (October 2026) and remains compatible with older versions. If a future ComfyUI release changes the API, parts of this program may break; check the releases page for updates.
