@@ -5,21 +5,38 @@ name: Windows release
 # Windows preinstalled; release uploads use the GitHub REST API via curl
 # (built into Windows). Register the VM with the label "windows".
 #
-# Security: the job only runs for this exact repo, only on tag pushes and
-# manual dispatch, and only when the repo's WINDOWS_RUNNER_SECRET matches
-# the expected value below. Forks do not inherit repo secrets, so a forked
-# copy of this workflow cannot pass the check.
+# Security model (defense in depth against untrusted PR code):
+#   1. Trigger guard: the jobs only run for this exact repo and for tag
+#      pushes, manual dispatch, or pull requests (job-level 'if').
+#   2. Secret handshake: the build job only proceeds when this repo's
+#      WINDOWS_RUNNER_SECRET matches the expected value below. No other
+#      repo can inject the secret, so no other repo can drive the runner.
+#   3. Manual approval: the build job uses the 'self-hosted' environment.
+#      With required reviewers set on it, NOTHING runs on the VM (not even
+#      checkout) until a human approves the run in the UI. This is the
+#      control that makes fork PRs safe.
+#   4. Security scan: a separate job on a GitHub-hosted runner runs
+#      'cargo audit' (deps vs RUSTSEC advisories) on the exact code the
+#      build would use, before the build job is allowed to start.
 #
-# Two ways to run it:
-#   - Push a semver tag (e.g. 1.2.0 or v1.2.0): creates/extends that release.
-#   - Manual dispatch with release_tag (e.g. 1.1.0): attaches the exe to an
-#     existing release without creating a new tag.
+# Setup: repo Settings > Environments > Add environment, name it
+# 'self-hosted', and add yourself as a required reviewer. Also set the
+# repo secret WINDOWS_RUNNER_SECRET (value must match EXPECTED_SECRET
+# below).
+#
+# Two ways to release:
+#   - Push a semver tag (e.g. 1.2.0 or v1.2.0): creates/extends that
+#     release.
+#   - Manual dispatch with release_tag (e.g. 1.1.0): attaches the exe to
+#     an existing release without creating a new tag.
+# Pull requests build but never create or modify releases.
 
 on:
   push:
     tags:
       - 'v*.*.*'
       - '*.*.*'
+  pull_request:
   workflow_dispatch:
     inputs:
       release_tag:
@@ -31,13 +48,30 @@ concurrency:
   group: windows-release
 
 jobs:
+  scan:
+    name: Security scan (GitHub-hosted)
+    runs-on: ubuntu-latest
+    if: github.repository == 'giacomoguiduzzi/yara'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
+
   build-windows:
+    name: Build + release (self-hosted)
     runs-on: [self-hosted, windows]
-    # Defense in depth: only this repo, only owner-controlled triggers.
+    environment: self-hosted
+    needs: scan
     if: >
       github.repository == 'giacomoguiduzzi/yara' &&
       (github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'push' && github.ref_type == 'tag'))
+        (github.event_name == 'push' && github.ref_type == 'tag') ||
+        github.event_name == 'pull_request')
     permissions:
       contents: write
     steps:
@@ -72,6 +106,7 @@ jobs:
         run: cargo build --release
 
       - name: Attach to release
+        if: github.event_name != 'pull_request'
         shell: powershell
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
