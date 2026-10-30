@@ -1,9 +1,14 @@
 name: Windows release
 
-# Builds yara.exe on the self-hosted Windows 11 VM and attaches it to a
-# GitHub release. The VM only needs Rust (rustup stable, MSVC) preinstalled;
-# release uploads use the GitHub REST API via curl (built into Windows).
-# Register the VM with the label "windows".
+# Builds yara.exe on the self-hosted Windows 10 VM and attaches it to a
+# GitHub release. The VM only needs Rust (rustup stable, MSVC) and Git for
+# Windows preinstalled; release uploads use the GitHub REST API via curl
+# (built into Windows). Register the VM with the label "windows".
+#
+# Security: the job only runs for this exact repo, only on tag pushes and
+# manual dispatch, and only when the repo's WINDOWS_RUNNER_SECRET matches
+# the expected value below. Forks do not inherit repo secrets, so a forked
+# copy of this workflow cannot pass the check.
 #
 # Two ways to run it:
 #   - Push a semver tag (e.g. 1.2.0 or v1.2.0): creates/extends that release.
@@ -22,14 +27,37 @@ on:
         required: true
         default: ''
 
+concurrency:
+  group: windows-release
+
 jobs:
   build-windows:
     runs-on: [self-hosted, windows]
+    # Defense in depth: only this repo, only owner-controlled triggers.
+    if: >
+      github.repository == 'giacomoguiduzzi/yara' &&
+      (github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'push' && github.ref_type == 'tag'))
+    permissions:
+      contents: write
     steps:
+      - name: Verify runner secret
+        shell: powershell
+        env:
+          RUNNER_SECRET: ${{ secrets.WINDOWS_RUNNER_SECRET }}
+          EXPECTED_SECRET: '090e00b9093c720dbafadbbbdb31b83f'
+        run: |
+          if (-not $env:RUNNER_SECRET) {
+            throw 'WINDOWS_RUNNER_SECRET is not set on this repo.'
+          }
+          if ($env:RUNNER_SECRET -ne $env:EXPECTED_SECRET) {
+            throw 'Runner secret mismatch - refusing to build.'
+          }
+
       - uses: actions/checkout@v4
 
       - name: Check Rust toolchain
-        shell: pwsh
+        shell: powershell
         run: |
           if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
             $msg = "cargo not found on this runner. "
@@ -40,11 +68,11 @@ jobs:
           cargo -V
 
       - name: Build
-        shell: pwsh
+        shell: powershell
         run: cargo build --release
 
       - name: Attach to release
-        shell: pwsh
+        shell: powershell
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -68,7 +96,7 @@ jobs:
             $payload = @{
               tag_name = $tag
               name = "yara $tag (Windows)"
-              body = 'Built on a self-hosted Windows 11 runner.'
+              body = 'Built on a self-hosted Windows 10 runner.'
             } | ConvertTo-Json
             curl.exe -s -X POST -H "Authorization: $auth" `
               -H 'Content-Type: application/json' --data $payload `
