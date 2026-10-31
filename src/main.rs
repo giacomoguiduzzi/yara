@@ -612,8 +612,6 @@ fn get_input_node_id(node: &Value, field: &str) -> String {
 
 
 fn image_generation_info() -> ImageGenInteractive {
-    use clipboard::{ClipboardProvider, ClipboardContext};
-
     // get input
     println!("Enter image filepath, or 'q' to quit:");
 
@@ -766,10 +764,18 @@ fn image_generation_info() -> ImageGenInteractive {
 
 
     // copy json string to clipboard, including newlines
-    let mut ctx: ClipboardContext = ClipboardProvider::new().unwrap();
     let x = serde_json::to_string_pretty(&prompt_json).unwrap();
-    ctx.set_contents(x).unwrap();
-    println!("Full generation data copied to clipboard.");
+    match arboard::Clipboard::new() {
+        Ok(mut clip) => match clip.set_text(&x) {
+            Ok(()) => println!("Full generation data copied to clipboard."),
+            Err(e) => println!(
+                "\x1b[31merror\x1b[0m:// failed to copy generation data to clipboard: {e}"
+            ),
+        },
+        Err(e) => {
+            println!("\x1b[31merror\x1b[0m:// failed to access clipboard: {e}")
+        }
+    }
     println!("--------------\n");
     return ImageGenInteractive::Repeat;
 }

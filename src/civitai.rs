@@ -3,8 +3,6 @@ use regex::Regex;
 
 const MAX_CONNECTION_ATTEMPTS: usize = 10;
 
-use clipboard::{ClipboardProvider, ClipboardContext};
-
 use std::env::Args;
 
 pub fn download(args: &mut std::iter::Skip<Args>) {
@@ -96,8 +94,17 @@ pub fn download(args: &mut std::iter::Skip<Args>) {
         }
     }
 
-    let mut ctx: ClipboardContext = ClipboardProvider::new().unwrap();
-    ctx.set_contents(clipboard_string).unwrap();
+    match arboard::Clipboard::new() {
+        Ok(mut clip) => match clip.set_text(&clipboard_string) {
+            Ok(()) => (),
+            Err(e) => {
+                println!("\x1b[31merror\x1b[0m:// failed to write to clipboard: {e}")
+            }
+        },
+        Err(e) => {
+            println!("\x1b[31merror\x1b[0m:// failed to access clipboard: {e}")
+        }
+    }
 }
 
 fn print_stuff(name: String, url: String, description: String, tag: String, keystring: String, filename: String) -> String {
