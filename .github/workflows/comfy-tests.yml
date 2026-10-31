@@ -32,6 +32,10 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build yara
+        env:
+          # GH runners ship CMake 4.x, which rejects the old
+          # cmake_minimum_required in glsl-to-spirv's vendored glslang
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
         run: cargo build --release
 
       - name: Download SD1.5 checkpoint (4.3 GB)

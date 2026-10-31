@@ -105,6 +105,10 @@ jobs:
 
       - name: Build
         shell: powershell
+        env:
+          # tolerate the old cmake_minimum_required in glsl-to-spirv's
+          # vendored glslang (same issue on CMake >= 4)
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
         run: cargo build --release
 
       - name: Attach to release
@@ -112,6 +116,9 @@ jobs:
         shell: powershell
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # workflow_dispatch input (shared across jobs via github.* context;
+          # it only reaches the script through this explicit env mapping)
+          INPUT_RELEASE_TAG: ${{ github.event.inputs.release_tag }}
         run: |
           if ($env:INPUT_RELEASE_TAG) {
             $tag = $env:INPUT_RELEASE_TAG
