@@ -182,7 +182,7 @@ done
 if [ -n "${SLOWNUM:-}" ]; then
     check "cancel running prompt (targeted interrupt)" timeout 60 $YARA cancel $SLOWNUM
     sleep 15
-    $PY - <<'EOF'
+    $PY - <<EOF
 import json, urllib.request
 
 def get(url):

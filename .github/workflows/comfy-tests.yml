@@ -46,7 +46,10 @@ jobs:
         env:
           IMAGE: ${{ matrix.image }}
         run: |
+          # the images hard-fail at import time without a GPU
+          # (model_management calls torch.cuda.current_device); --cpu fixes it
           docker run -d --name comfy-test -p 8188:8188 \
+            -e COMFYUI_EXTRA_ARGS=--cpu \
             -v "$PWD/.comfytest/output:/app/output" \
             -v "$PWD/.comfytest/input:/app/input" \
             -v "$PWD/.comfytest/user:/app/user" \
@@ -67,8 +70,10 @@ jobs:
 
       - name: Run end-to-end suite (CPU)
         env:
+          # yara reads its config from $HOME/yara on Linux (get_appdata),
+          # so point HOME at runner.temp to keep the run self-contained
+          HOME: ${{ runner.temp }}/home
           YARA_BIN: ${{ github.workspace }}/target/release/yara
           COMFY_DIR: ${{ github.workspace }}/.comfytest
-          YARA_DATA_DIR: ${{ runner.temp }}/yara
           SUITE_SLOW: "1"
         run: bash .comfytest/tests/run_tests.sh
