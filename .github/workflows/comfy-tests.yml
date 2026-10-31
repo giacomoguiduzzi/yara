@@ -1,0 +1,74 @@
+name: ComfyUI e2e tests
+
+# Runs the committed end-to-end suite (.comfytest/tests/run_tests.sh) against
+# both current ComfyUI docker images, on GitHub-hosted CPU runners.
+on:
+  push:
+    branches: [main]
+    tags: ['v*.*.*', '*.*.*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: comfy-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    name: e2e vs ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - obeliks/comfyui:master-cu128
+          - obeliks/comfyui:master-cu130
+    steps:
+      # actions/checkout v4.4.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build yara
+        run: cargo build --release
+
+      - name: Download SD1.5 checkpoint (4.3 GB)
+        run: |
+          mkdir -p .comfytest/models/checkpoints
+          curl -sfL --retry 3 --retry-delay 10 \
+            -o .comfytest/models/checkpoints/v1-5-pruned.ckpt \
+            https://civitai.com/api/download/models/4
+          ls -l .comfytest/models/checkpoints/
+
+      - name: Start ComfyUI (${{ matrix.image }}, CPU mode)
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          docker run -d --name comfy-test -p 8188:8188 \
+            -v "$PWD/.comfytest/output:/app/output" \
+            -v "$PWD/.comfytest/input:/app/input" \
+            -v "$PWD/.comfytest/user:/app/user" \
+            -v "$PWD/.comfytest/models:/app/models" \
+            -v "$PWD/.comfytest/custom_nodes:/app/custom_nodes" \
+            -v "$PWD/.comfytest/custom_venv:/app/custom_venv" \
+            "$IMAGE"
+          for i in $(seq 1 120); do
+            if curl -sf http://localhost:8188/queue > /dev/null; then
+              echo "ComfyUI ready after $((i * 2))s"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "ComfyUI failed to become ready"
+          docker logs comfy-test | tail -50
+          exit 1
+
+      - name: Run end-to-end suite (CPU)
+        env:
+          YARA_BIN: ${{ github.workspace }}/target/release/yara
+          COMFY_DIR: ${{ github.workspace }}/.comfytest
+          YARA_DATA_DIR: ${{ runner.temp }}/yara
+          SUITE_SLOW: "1"
+        run: bash .comfytest/tests/run_tests.sh

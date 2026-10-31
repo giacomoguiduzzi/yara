@@ -53,7 +53,8 @@ jobs:
     runs-on: ubuntu-latest
     if: github.repository == 'giacomoguiduzzi/yara'
     steps:
-      - uses: actions/checkout@v4
+      # actions/checkout v4.4.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -88,7 +89,8 @@ jobs:
             throw 'Runner secret mismatch - refusing to build.'
           }
 
-      - uses: actions/checkout@v4
+      # actions/checkout v4.4.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
       - name: Check Rust toolchain
         shell: powershell
