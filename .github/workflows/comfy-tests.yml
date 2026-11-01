@@ -54,8 +54,9 @@ jobs:
           # the image user is uid 1000 and its entrypoint chowns/chgrps the
           # mounted dirs; the GH runner (uid 1001) owns them by default,
           # which makes the entrypoint rsync fail with EPERM/EACCES
-          sudo chown -R 1000:1000 .comfytest
+          # chmod must run BEFORE chown: chmod needs ownership, chown does not
           chmod -R 777 .comfytest
+          sudo chown -R 1000:1000 .comfytest
 
       - name: Start ComfyUI (${{ matrix.image }}, CPU mode)
         env:
