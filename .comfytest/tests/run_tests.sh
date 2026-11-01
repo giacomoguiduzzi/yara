@@ -25,7 +25,7 @@ PY=python3
 
 # CPU runners are tens of times slower than a GPU; scale the time budgets
 if [ "${SUITE_SLOW:-0}" = "1" ]; then
-    DRAIN=900; LOADTO=1800; WAITTO=900; REGENTO=1800
+    DRAIN=2400; LOADTO=3600; WAITTO=900; REGENTO=1800
 else
     DRAIN=300; LOADTO=300; WAITTO=300; REGENTO=600
 fi

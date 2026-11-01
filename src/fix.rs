@@ -265,12 +265,25 @@ fn inject_workflow_into_image(image_path: &PathBuf, workflow: &Value) -> Result<
     reader.read_to_end(&mut buf).map_err(|err| err.to_string())?;
     bytes.extend(buf);
 
-    // Write the file, overwriting previous image
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(image_path)
-        .map_err(|err| err.to_string())?;
-    file.write_all(&bytes).map_err(|err| err.to_string())?;
+    // Write to a temp file in the same directory, then rename over the
+    // original. Rename only needs write access to the directory (not to
+    // the file itself), so this works even when the PNG is owned by
+    // another user — e.g. a container-hosted ComfyUI (uid 1000) writing
+    // files that this process (a different uid) must re-embed.
+    let mut tmp_os = image_path.as_os_str().to_os_string();
+    tmp_os.push(".yara_tmp");
+    let tmp_path = PathBuf::from(tmp_os);
+    let mut file = match fs::File::create(&tmp_path) {
+        Ok(f) => f,
+        Err(err) => return Err(err.to_string()),
+    };
+    if let Err(err) = file.write_all(&bytes) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err.to_string());
+    }
+    if let Err(err) = fs::rename(&tmp_path, image_path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err.to_string());
+    }
     Ok(())
 }
