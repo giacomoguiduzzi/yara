@@ -165,11 +165,15 @@ jobs:
           # api.github.com .../releases/{id}/assets route now 404s.
           # The release object's upload_url points at the live route.
           $uploadBase = ($rel.upload_url -replace '\{.*$','')
+          # Build the query via concatenation: in double-quoted strings
+          # PowerShell reads $uploadBase?name as ONE variable name
+          # (the ? is absorbed), yielding an empty host for curl.
+          $uploadUrl = $uploadBase + '?name=yara.exe' + '&label=Windows'
           $upload = curl.exe -s -S -w '\nHTTP:%{http_code}' `
             -X POST -H "Authorization: $auth" `
             -H 'Content-Type: application/octet-stream' `
             --data-binary "@$exe" `
-            "$uploadBase?name=yara.exe&label=Windows"
+            $uploadUrl
           if ($upload -notmatch 'HTTP:201') {
             throw "Asset upload failed:`n$upload"
           }
