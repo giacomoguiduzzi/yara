@@ -161,11 +161,15 @@ jobs:
                 "$api/repos/$repo/releases/assets/$($asset.id)" | Out-Null
             }
           }
+          # asset uploads live on uploads.github.com; the legacy
+          # api.github.com .../releases/{id}/assets route now 404s.
+          # The release object's upload_url points at the live route.
+          $uploadBase = ($rel.upload_url -replace '\{.*$','')
           $upload = curl.exe -s -S -w '\nHTTP:%{http_code}' `
             -X POST -H "Authorization: $auth" `
             -H 'Content-Type: application/octet-stream' `
             --data-binary "@$exe" `
-            "$($rel.url)/assets?name=yara.exe&label=Windows"
+            "$uploadBase?name=yara.exe&label=Windows"
           if ($upload -notmatch 'HTTP:201') {
             throw "Asset upload failed:`n$upload"
           }
