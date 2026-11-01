@@ -134,6 +134,8 @@ jobs:
           if (-not (Test-Path $exe)) {
             throw "Build did not produce $exe"
           }
+          # every API call is verified: on failure the step throws with the
+          # HTTP status and body instead of printing a fake success
           $code = curl.exe -s -o NUL -w '%{http_code}' `
             -H "Authorization: $auth" "$api/repos/$repo/releases/tags/$tag"
           if ($code -ne '200') {
@@ -142,12 +144,16 @@ jobs:
               name = "yara $tag (Windows)"
               body = 'Built on a self-hosted Windows 10 runner.'
             } | ConvertTo-Json
-            curl.exe -s -X POST -H "Authorization: $auth" `
+            $created = curl.exe -s -S -w '\nHTTP:%{http_code}' `
+              -X POST -H "Authorization: $auth" `
               -H 'Content-Type: application/json' --data $payload `
-              "$api/repos/$repo/releases" | Out-Null
+              "$api/repos/$repo/releases"
+            if ($created -notmatch 'HTTP:201') {
+              throw "Release creation failed:`n$created"
+            }
             Write-Host "Created release $tag"
           }
-          $rel = (curl.exe -s -H "Authorization: $auth" `
+          $rel = (curl.exe -s -S -H "Authorization: $auth" `
             "$api/repos/$repo/releases/tags/$tag") | ConvertFrom-Json
           foreach ($asset in $rel.assets) {
             if ($asset.name -eq 'yara.exe') {
@@ -155,8 +161,19 @@ jobs:
                 "$api/repos/$repo/releases/assets/$($asset.id)" | Out-Null
             }
           }
-          curl.exe -s -X POST -H "Authorization: $auth" `
+          $upload = curl.exe -s -S -w '\nHTTP:%{http_code}' `
+            -X POST -H "Authorization: $auth" `
             -H 'Content-Type: application/octet-stream' `
             --data-binary "@$exe" `
-            "$($rel.url)/assets?name=yara.exe&label=Windows" | Out-Null
+            "$($rel.url)/assets?name=yara.exe&label=Windows"
+          if ($upload -notmatch 'HTTP:201') {
+            throw "Asset upload failed:`n$upload"
+          }
+          $check = (curl.exe -s -S -H "Authorization: $auth" `
+            "$api/repos/$repo/releases/tags/$tag") | ConvertFrom-Json
+          if (-not ($check.assets | Where-Object {
+              $_.name -eq 'yara.exe'
+          })) {
+            throw 'yara.exe not found on the release after upload'
+          }
           Write-Host "Attached yara.exe to release $tag"

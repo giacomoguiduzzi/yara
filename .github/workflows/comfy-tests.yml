@@ -46,6 +46,17 @@ jobs:
             https://civitai.com/api/download/models/4
           ls -l .comfytest/models/checkpoints/
 
+      - name: Prepare ComfyUI dirs (container runs as uid 1000)
+        run: |
+          mkdir -p .comfytest/output .comfytest/input .comfytest/user
+          mkdir -p .comfytest/models .comfytest/custom_nodes
+          mkdir -p .comfytest/custom_venv
+          # the image user is uid 1000 and its entrypoint chowns/chgrps the
+          # mounted dirs; the GH runner (uid 1001) owns them by default,
+          # which makes the entrypoint rsync fail with EPERM/EACCES
+          sudo chown -R 1000:1000 .comfytest
+          chmod -R 777 .comfytest
+
       - name: Start ComfyUI (${{ matrix.image }}, CPU mode)
         env:
           IMAGE: ${{ matrix.image }}
