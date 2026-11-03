@@ -1,28 +1,130 @@
 name: ComfyUI e2e tests
 
-# Runs the committed end-to-end suite (.comfytest/tests/run_tests.sh) against
-# both current ComfyUI docker images, on GitHub-hosted CPU runners.
+# Runs the committed end-to-end suite (.comfytest/tests/run_tests.sh)
+# against the current ComfyUI docker images, on GitHub-hosted CPU
+# runners.
 #
-# MANUAL ONLY (workflow_dispatch): each run is ~2 x ~75 min of CPU on
-# GitHub-hosted runners, which would exhaust the fork's free minutes if it
-# ran on every push/tag/PR. Run it explicitly from the Actions tab.
+# MANUAL ONLY (workflow_dispatch): each leg is ~75 min of CPU on a
+# GitHub-hosted runner, which would exhaust the fork's free minutes if
+# it ran on every push/tag/PR. Run it explicitly from the Actions tab;
+# the "only" input selects one leg (its README badge updates
+# independently of the other).
+#
+# Per-leg badges: each image is its own job (e2e-cu128 / e2e-cu130),
+# so the README can use comfy-tests.yml/badge.svg?job=<id> and each
+# leg shows its own latest status. (GitHub does not resolve YAML
+# merge keys in workflows, so the two jobs are written out in full -
+# keep their steps in sync if you edit one.)
 "on":
   workflow_dispatch:
+    inputs:
+      only:
+        description: Which ComfyUI image(s) to test
+        type: choice
+        default: both
+        options:
+          - both
+          - cu128
+          - cu130
 
 concurrency:
   group: comfy-e2e-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  e2e:
-    name: e2e vs ${{ matrix.image }}
+  e2e-cu128:
+    name: e2e vs obeliks/comfyui:master-cu128
     runs-on: ubuntu-latest
     timeout-minutes: 240
+    if: >-
+      github.event_name != 'workflow_dispatch' ||
+      github.event.inputs.only == 'both' ||
+      github.event.inputs.only == 'cu128'
     strategy:
-      fail-fast: false
       matrix:
         image:
           - obeliks/comfyui:master-cu128
+    steps:
+      # actions/checkout v4.4.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build yara
+        env:
+          # GH runners ship CMake 4.x, which rejects the old
+          # cmake_minimum_required in glsl-to-spirv's vendored glslang
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+        run: cargo build --release
+
+      - name: Download SD1.5 checkpoint (4.3 GB)
+        run: |
+          mkdir -p .comfytest/models/checkpoints
+          curl -sfL --retry 3 --retry-delay 10 \
+            -o .comfytest/models/checkpoints/v1-5-pruned.ckpt \
+            https://civitai.com/api/download/models/4
+          ls -l .comfytest/models/checkpoints/
+
+      - name: Prepare ComfyUI dirs (container runs as uid 1000)
+        run: |
+          mkdir -p .comfytest/output .comfytest/input .comfytest/user
+          mkdir -p .comfytest/models .comfytest/custom_nodes
+          mkdir -p .comfytest/custom_venv
+          # the image user is uid 1000 and its entrypoint chowns/chgrps the
+          # mounted dirs; the GH runner (uid 1001) owns them by default,
+          # which makes the entrypoint rsync fail with EPERM/EACCES
+          # chmod must run BEFORE chown: chmod needs ownership, chown does not
+          chmod -R 777 .comfytest
+          sudo chown -R 1000:1000 .comfytest
+
+      - name: Start ComfyUI (${{ matrix.image }}, CPU mode)
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          # the images hard-fail at import time without a GPU
+          # (model_management calls torch.cuda.current_device); --cpu fixes it
+          docker run -d --name comfy-test -p 8188:8188 \
+            -e COMFYUI_EXTRA_ARGS=--cpu \
+            -v "$PWD/.comfytest/output:/app/output" \
+            -v "$PWD/.comfytest/input:/app/input" \
+            -v "$PWD/.comfytest/user:/app/user" \
+            -v "$PWD/.comfytest/models:/app/models" \
+            -v "$PWD/.comfytest/custom_nodes:/app/custom_nodes" \
+            -v "$PWD/.comfytest/custom_venv:/app/custom_venv" \
+            "$IMAGE"
+          for i in $(seq 1 120); do
+            if curl -sf http://localhost:8188/queue > /dev/null; then
+              echo "ComfyUI ready after $((i * 2))s"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "ComfyUI failed to become ready"
+          docker logs comfy-test | tail -50
+          exit 1
+
+      - name: Run end-to-end suite (CPU)
+        env:
+          # yara reads its config from $HOME/yara on Linux (get_appdata),
+          # so point HOME at runner.temp to keep the run self-contained
+          HOME: ${{ runner.temp }}/home
+          YARA_BIN: ${{ github.workspace }}/target/release/yara
+          COMFY_DIR: ${{ github.workspace }}/.comfytest
+          SUITE_SLOW: "1"
+        run: bash .comfytest/tests/run_tests.sh
+
+  e2e-cu130:
+    name: e2e vs obeliks/comfyui:master-cu130
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    if: >-
+      github.event_name != 'workflow_dispatch' ||
+      github.event.inputs.only == 'both' ||
+      github.event.inputs.only == 'cu130'
+    strategy:
+      matrix:
+        image:
           - obeliks/comfyui:master-cu130
     steps:
       # actions/checkout v4.4.0
