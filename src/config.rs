@@ -132,7 +132,18 @@ pub fn create_new_config() {
     config_root += "/yara";
 
     println!("Please select the \"output\" folder in your ComfyUI directory:");
-    let comfyui_output_directory: PathBuf = FileDialog::new().show_open_single_dir().unwrap().unwrap();
+    let comfyui_output_directory = match FileDialog::new().show_open_single_dir() {
+        Ok(Some(p)) => p,
+        // Headless (no GUI session, e.g. SSH or CI) or the user cancelled:
+        // fall back to a default folder instead of panicking. Edit
+        // config.json later, or re-run in a GUI session to pick it.
+        _ => {
+            let fallback = PathBuf::from(get_appdata() + "/comfyui/output");
+            println!("    Folder picker unavailable - using {fallback:?} instead.");
+            println!("    Edit config.json to point at your ComfyUI output folder.");
+            fallback
+        }
+    };
 
     let comfyui_input_directory = derive_input_path_from_output_path(&comfyui_output_directory);
     let regen_directory = derive_regen_path_from_output_path(&comfyui_output_directory);

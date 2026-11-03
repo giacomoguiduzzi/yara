@@ -31,6 +31,9 @@ in CPU mode.
 
 - A `yara` binary (default: `target/debug/yara`, override with `YARA_BIN`).
 - Python 3 (stdlib only).
+- Yara's data dir is `$HOME/yara` on Linux (`get_appdata` in `src/config.rs`);
+  the script writes its `config.json` there. To use a scratch data dir, set
+  `HOME=<scratch>` (and optionally `YARA_DATA_DIR=<scratch>/yara`).
 
 ## Running
 

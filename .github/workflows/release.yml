@@ -1,0 +1,310 @@
+name: Release
+
+# Unified release pipeline: one security scan, then ONE environment
+# approval releases both build jobs (same protected environment), and
+# both binaries are attached to the tag's release.
+#
+#   scan (free runner) ──> prepare-release (free runner)
+#        ├──> build-linux   (free runner, distro selectable)
+#        └──> build-windows (self-hosted Windows 10 VM)
+#
+# Security model (defense in depth against untrusted PR code):
+#   1. Trigger guard: jobs only run for this exact repo (job 'if').
+#   2. Secret handshake: the Windows build only proceeds when the repo
+#      secret WINDOWS_RUNNER_SECRET matches the expected value below.
+#   3. Manual approval: both build jobs use the 'self-hosted'
+#      environment. With required reviewers set, NOTHING runs (not even
+#      checkout) until a human approves the run; one approval releases
+#      both jobs of the same run. This is the control that makes fork
+#      PRs safe.
+#   4. Security scan: 'cargo audit' runs on a GitHub-hosted runner
+#      against the exact code that would be built, before any build job
+#      is allowed to start.
+#   5. PR runs never create or modify releases: the attach steps are
+#      skipped and fork PR tokens are read-only.
+#
+# Setup: repo Settings > Environments > add 'self-hosted' with yourself
+# as required reviewer. Register the Windows 10 VM with labels
+# self-hosted + windows (it only needs Rust stable MSVC and Git for
+# Windows). Set the repo secret WINDOWS_RUNNER_SECRET (value must match
+# EXPECTED_SECRET in build-windows).
+#
+# Releasing: push a semver tag (e.g. 1.2.0 or v1.2.0), or dispatch with
+# release_tag. Manual dispatches can pick the Linux distro via
+# linux_runner; tag pushes and PRs use ubuntu-latest. For the best
+# binary compatibility pick the OLDEST distro you care about - the
+# binary is glibc-linked, so it runs on that distro and anything newer.
+
+"on":
+  push:
+    tags: ['v*.*.*', '*.*.*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag to build/attach for (created if missing)
+        required: true
+        type: string
+      linux_runner:
+        description: Runner/distro for the Linux build
+        type: choice
+        default: ubuntu-latest
+        options:
+          - ubuntu-latest
+          - ubuntu-24.04
+          - ubuntu-22.04
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+
+jobs:
+  scan:
+    name: Security scan (free runner)
+    runs-on: ubuntu-latest
+    if: github.repository == 'giacomoguiduzzi/yara'
+    steps:
+      # actions/checkout v4.4.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
+
+  prepare-release:
+    name: Prepare release (free runner)
+    runs-on: ubuntu-latest
+    needs: [scan]
+    # only meaningful when a tag is known (dispatch or tag push)
+    if: >-
+      github.repository == 'giacomoguiduzzi/yara' &&
+      (github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'push' && github.ref_type == 'tag'))
+    concurrency:
+      group: release-prepare
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      INPUT_RELEASE_TAG: ${{ github.event.inputs.release_tag }}
+    steps:
+      - name: Ensure release exists for the tag
+        run: |
+          if [ -n "$INPUT_RELEASE_TAG" ]; then
+            TAG="$INPUT_RELEASE_TAG"
+          else
+            TAG="$GITHUB_REF_NAME"
+          fi
+          api=https://api.github.com
+          auth="token $GH_TOKEN"
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "Authorization: $auth" \
+            "$api/repos/$GITHUB_REPOSITORY/releases/tags/$TAG")
+          if [ "$code" = "200" ]; then
+            echo "release for $TAG already exists"
+            exit 0
+          fi
+          payload=$(printf '{"tag_name":"%s","name":"yara %s"}' \
+            "$TAG" "$TAG")
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+            -H "Authorization: $auth" \
+            -H 'Content-Type: application/json' \
+            --data "$payload" \
+            "$api/repos/$GITHUB_REPOSITORY/releases")
+          if [ "$code" != "201" ]; then
+            echo "release creation failed: HTTP $code" >&2
+            exit 1
+          fi
+          echo "created release for $TAG"
+
+  build-linux:
+    name: Build + attach Linux
+    runs-on: ${{ github.event.inputs.linux_runner || 'ubuntu-latest' }}
+    needs: [scan, prepare-release]
+    if: github.repository == 'giacomoguiduzzi/yara'
+    environment: self-hosted
+    env:
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      INPUT_RELEASE_TAG: ${{ github.event.inputs.release_tag }}
+    steps:
+      # actions/checkout v4.4.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release binary
+        run: |
+          cargo build --release
+          test -x target/release/yara
+          # first launch runs the config wizard; headless runners take
+          # the graceful fallback, so this is safe without a display
+          ./target/release/yara > /dev/null
+          echo "built and smoke-tested target/release/yara"
+      - name: Attach to release
+        if: github.event_name != 'pull_request'
+        run: |
+          if [ -n "$INPUT_RELEASE_TAG" ]; then
+            TAG="$INPUT_RELEASE_TAG"
+          else
+            TAG="$GITHUB_REF_NAME"
+          fi
+          asset="yara-$TAG-linux"
+          api=https://api.github.com
+          auth="token $GH_TOKEN"
+          rel=$(curl -sf -H "Authorization: $auth" \
+            "$api/repos/$GITHUB_REPOSITORY/releases/tags/$TAG")
+          # asset uploads live on uploads.github.com; the release
+          # object's upload_url points at the live route (the legacy
+          # api.github.com .../releases/{id}/assets POST now 404s)
+          base=$(printf '%s' "$rel" | jq -r '.upload_url')
+          base=${base%%\{*}
+          # idempotent: drop any previous asset with the same name
+          old=$(printf '%s' "$rel" | jq -r --arg n "$asset" \
+            '.assets[]? | select(.name == $n) | .id')
+          if [ -n "$old" ] && [ "$old" != "null" ]; then
+            curl -sf -X DELETE -H "Authorization: $auth" \
+              "$api/repos/$GITHUB_REPOSITORY/releases/assets/$old"
+          fi
+          out=$(curl -sS -w '\nHTTP:%{http_code}' -X POST \
+            -H "Authorization: $auth" \
+            -H 'Content-Type: application/octet-stream' \
+            --data-binary "@target/release/yara" \
+            "$base?name=$asset&label=Linux")
+          # the -w trailer is the last line; the JSON body may
+          # incidentally contain "201", so match the exact line
+          status=$(printf '%s' "$out" | tail -n 1)
+          if [ "$status" != "HTTP:201" ]; then
+            echo "asset upload failed:"
+            printf '%s\n' "$out"
+            exit 1
+          fi
+          # verify the asset is visible on the release
+          check=$(curl -sf -H "Authorization: $auth" \
+            "$api/repos/$GITHUB_REPOSITORY/releases/tags/$TAG")
+          printf '%s' "$check" | jq -e --arg n "$asset" \
+            '.assets[]? | select(.name == $n)' > /dev/null
+          echo "attached $asset to release $TAG"
+
+  build-windows:
+    name: Build + attach Windows (self-hosted)
+    runs-on: [self-hosted, windows]
+    needs: [scan, prepare-release]
+    if: >
+      github.repository == 'giacomoguiduzzi/yara' &&
+      (github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'push' && github.ref_type == 'tag') ||
+        github.event_name == 'pull_request')
+    environment: self-hosted
+    steps:
+      - name: Verify runner secret
+        shell: powershell
+        env:
+          RUNNER_SECRET: ${{ secrets.WINDOWS_RUNNER_SECRET }}
+          EXPECTED_SECRET: '090e00b9093c720dbafadbbbdb31b83f'
+        run: |
+          if (-not $env:RUNNER_SECRET) {
+            throw 'WINDOWS_RUNNER_SECRET is not set on this repo.'
+          }
+          if ($env:RUNNER_SECRET -ne $env:EXPECTED_SECRET) {
+            throw 'Runner secret mismatch - refusing to build.'
+          }
+
+      # actions/checkout v4.4.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Check Rust toolchain
+        shell: powershell
+        run: |
+          if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+            $msg = "cargo not found on this runner. "
+            $msg += "Install Rust (rustup, stable MSVC) on the VM."
+            throw $msg
+          }
+          rustc -V
+          cargo -V
+
+      - name: Build
+        shell: powershell
+        env:
+          # tolerate the old cmake_minimum_required in glsl-to-spirv's
+          # vendored glslang (same issue on CMake >= 4)
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+        run: cargo build --release
+
+      - name: Attach to release
+        if: github.event_name != 'pull_request'
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # workflow_dispatch input (shared across jobs via github.* context;
+          # it only reaches the script through this explicit env mapping)
+          INPUT_RELEASE_TAG: ${{ github.event.inputs.release_tag }}
+        run: |
+          if ($env:INPUT_RELEASE_TAG) {
+            $tag = $env:INPUT_RELEASE_TAG
+          } elseif ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $tag = $env:GITHUB_REF_NAME
+          } else {
+            throw "No release tag: push a tag, or provide release_tag."
+          }
+          $api = 'https://api.github.com'
+          $repo = $env:GITHUB_REPOSITORY
+          $auth = "token $($env:GH_TOKEN)"
+          $exe = 'target\release\yara.exe'
+          if (-not (Test-Path $exe)) {
+            throw "Build did not produce $exe"
+          }
+          # every API call is verified: on failure the step throws with
+          # the HTTP status and body instead of printing a fake success
+          $code = curl.exe -s -o NUL -w '%{http_code}' `
+            -H "Authorization: $auth" "$api/repos/$repo/releases/tags/$tag"
+          if ($code -ne '200') {
+            $payload = @{
+              tag_name = $tag
+              name = "yara $tag"
+              body = 'Built by the unified release pipeline.'
+            } | ConvertTo-Json
+            # join to one string: multi-line output is an array in
+            # PowerShell, and -notmatch on an array FILTERS it, so the
+            # JSON body line alone would make the if-branch fire.
+            $created = (curl.exe -s -S -w '\nHTTP:%{http_code}' `
+              -X POST -H "Authorization: $auth" `
+              -H 'Content-Type: application/json' --data $payload `
+              "$api/repos/$repo/releases") -join "`n"
+            if ($created -notmatch 'HTTP:201') {
+              throw "Release creation failed:`n$created"
+            }
+            Write-Host "Created release $tag"
+          }
+          $rel = (curl.exe -s -S -H "Authorization: $auth" `
+            "$api/repos/$repo/releases/tags/$tag") | ConvertFrom-Json
+          foreach ($asset in $rel.assets) {
+            if ($asset.name -eq 'yara.exe') {
+              curl.exe -s -X DELETE -H "Authorization: $auth" `
+                "$api/repos/$repo/releases/assets/$($asset.id)" | Out-Null
+            }
+          }
+          # asset uploads live on uploads.github.com; the legacy
+          # api.github.com .../releases/{id}/assets route now 404s.
+          # The release object's upload_url points at the live route.
+          $uploadBase = ($rel.upload_url -replace '\{.*$','')
+          # Build the query via concatenation: in double-quoted strings
+          # PowerShell reads $uploadBase?name as ONE variable name
+          # (the ? is absorbed), yielding an empty host for curl.
+          $uploadUrl = $uploadBase + '?name=yara.exe' + '&label=Windows'
+          $upload = (curl.exe -s -S -w '\nHTTP:%{http_code}' `
+            -X POST -H "Authorization: $auth" `
+            -H 'Content-Type: application/octet-stream' `
+            --data-binary "@$exe" `
+            $uploadUrl) -join "`n"
+          if ($upload -notmatch 'HTTP:201') {
+            throw "Asset upload failed:`n$upload"
+          }
+          $check = (curl.exe -s -S -H "Authorization: $auth" `
+            "$api/repos/$repo/releases/tags/$tag") | ConvertFrom-Json
+          if (-not ($check.assets | Where-Object {
+              $_.name -eq 'yara.exe'
+          })) {
+            throw 'yara.exe not found on the release after upload'
+          }
+          Write-Host "Attached yara.exe to release $tag"
