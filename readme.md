@@ -1,4 +1,4 @@
-
+[![ComfyUI e2e tests](https://github.com/giacomoguiduzzi/yara/actions/workflows/comfy-tests.yml/badge.svg)](https://github.com/giacomoguiduzzi/yara/actions/workflows/comfy-tests.yml) [![Linux release](https://github.com/giacomoguiduzzi/yara/actions/workflows/linux-release.yml/badge.svg)](https://github.com/giacomoguiduzzi/yara/actions/workflows/linux-release.yml) [![Windows release](https://github.com/giacomoguiduzzi/yara/actions/workflows/windows-release.yml/badge.svg)](https://github.com/giacomoguiduzzi/yara/actions/workflows/windows-release.yml)
 
 Yara
 =======
