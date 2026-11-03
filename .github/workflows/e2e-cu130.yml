@@ -1,0 +1,99 @@
+name: e2e vs cu130
+
+# One leg of the ComfyUI e2e matrix (the other: e2e-cu128.yml).
+#
+# MANUAL ONLY (workflow_dispatch): each run is ~75 min of CPU on a
+# GitHub-hosted runner, which would exhaust the fork's free minutes if
+# it ran on every push/tag/PR. Run it explicitly from the Actions tab;
+# dispatching only this file tests only this leg, and only this
+# workflow's README badge updates.
+#
+# The two e2e files are separate workflows (not a matrix in one file)
+# so each leg gets its own workflow name and therefore its own README
+# badge label - the native badge label is always the workflow name.
+# Keep the jobs in sync if you edit one.
+"on":
+  workflow_dispatch:
+
+concurrency:
+  group: comfy-e2e-cu130-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    name: e2e vs obeliks/comfyui:master-cu130
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      matrix:
+        image:
+          - obeliks/comfyui:master-cu130
+    steps:
+      # actions/checkout v4.4.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build yara
+        env:
+          # GH runners ship CMake 4.x, which rejects the old
+          # cmake_minimum_required in glsl-to-spirv's vendored glslang
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+        run: cargo build --release
+
+      - name: Download SD1.5 checkpoint (4.3 GB)
+        run: |
+          mkdir -p .comfytest/models/checkpoints
+          curl -sfL --retry 3 --retry-delay 10 \
+            -o .comfytest/models/checkpoints/v1-5-pruned.ckpt \
+            https://civitai.com/api/download/models/4
+          ls -l .comfytest/models/checkpoints/
+
+      - name: Prepare ComfyUI dirs (container runs as uid 1000)
+        run: |
+          mkdir -p .comfytest/output .comfytest/input .comfytest/user
+          mkdir -p .comfytest/models .comfytest/custom_nodes
+          mkdir -p .comfytest/custom_venv
+          # the image user is uid 1000 and its entrypoint chowns/chgrps the
+          # mounted dirs; the GH runner (uid 1001) owns them by default,
+          # which makes the entrypoint rsync fail with EPERM/EACCES
+          # chmod must run BEFORE chown: chmod needs ownership, chown does not
+          chmod -R 777 .comfytest
+          sudo chown -R 1000:1000 .comfytest
+
+      - name: Start ComfyUI (${{ matrix.image }}, CPU mode)
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          # the images hard-fail at import time without a GPU
+          # (model_management calls torch.cuda.current_device); --cpu fixes it
+          docker run -d --name comfy-test -p 8188:8188 \
+            -e COMFYUI_EXTRA_ARGS=--cpu \
+            -v "$PWD/.comfytest/output:/app/output" \
+            -v "$PWD/.comfytest/input:/app/input" \
+            -v "$PWD/.comfytest/user:/app/user" \
+            -v "$PWD/.comfytest/models:/app/models" \
+            -v "$PWD/.comfytest/custom_nodes:/app/custom_nodes" \
+            -v "$PWD/.comfytest/custom_venv:/app/custom_venv" \
+            "$IMAGE"
+          for i in $(seq 1 120); do
+            if curl -sf http://localhost:8188/queue > /dev/null; then
+              echo "ComfyUI ready after $((i * 2))s"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "ComfyUI failed to become ready"
+          docker logs comfy-test | tail -50
+          exit 1
+
+      - name: Run end-to-end suite (CPU)
+        env:
+          # yara reads its config from $HOME/yara on Linux (get_appdata),
+          # so point HOME at runner.temp to keep the run self-contained
+          HOME: ${{ runner.temp }}/home
+          YARA_BIN: ${{ github.workspace }}/target/release/yara
+          COMFY_DIR: ${{ github.workspace }}/.comfytest
+          SUITE_SLOW: "1"
+        run: bash .comfytest/tests/run_tests.sh

@@ -1,39 +1,42 @@
-name: Release
+name: Windows release
 
-# Unified release pipeline: one security scan, then ONE environment
-# approval releases both build jobs (same protected environment), and
-# both binaries are attached to the tag's release.
+# Windows half of the release pipeline (the Linux half is
+# linux-release.yml, with the same scan + prepare + build shape).
 #
-#   scan (free runner) ──> prepare-release (free runner)
-#        ├──> build-linux   (free runner, distro selectable)
-#        └──> build-windows (self-hosted Windows 10 VM)
+# One file per platform so each platform gets its own workflow name
+# and therefore its own README badge label - the native badge label
+# is always the workflow name and cannot be overridden. Trade-off vs
+# a single unified workflow: a release runs the scan twice and asks
+# for two environment approvals (one per platform).
+#
+# Releasing: push a semver tag (both workflows run and both platforms
+# build), or dispatch this workflow (and linux-release.yml) with
+# release_tag.
 #
 # Security model (defense in depth against untrusted PR code):
 #   1. Trigger guard: jobs only run for this exact repo (job 'if').
-#   2. Secret handshake: the Windows build only proceeds when the repo
-#      secret WINDOWS_RUNNER_SECRET matches the expected value below.
-#   3. Manual approval: both build jobs use the 'self-hosted'
-#      environment. With required reviewers set, NOTHING runs (not even
-#      checkout) until a human approves the run; one approval releases
-#      both jobs of the same run. This is the control that makes fork
-#      PRs safe.
+#   2. Secret handshake: the build only proceeds when the repo secret
+#      WINDOWS_RUNNER_SECRET matches the expected value below; forks
+#      do not inherit repo secrets.
+#   3. Manual approval: the build job uses the 'self-hosted'
+#      environment; with required reviewers set, NOTHING runs on the
+#      Windows VM (not even checkout) until a human approves the run.
+#      This is the control that makes fork PRs safe.
 #   4. Security scan: 'cargo audit' runs on a GitHub-hosted runner
-#      against the exact code that would be built, before any build job
-#      is allowed to start.
-#   5. PR runs never create or modify releases: the attach steps are
+#      against the exact code that would be built, before the build
+#      job is allowed to start.
+#   5. PR runs never create or modify releases: the attach step is
 #      skipped and fork PR tokens are read-only.
 #
-# Setup: repo Settings > Environments > add 'self-hosted' with yourself
-# as required reviewer. Register the Windows 10 VM with labels
-# self-hosted + windows (it only needs Rust stable MSVC and Git for
-# Windows). Set the repo secret WINDOWS_RUNNER_SECRET (value must match
-# EXPECTED_SECRET in build-windows).
+# Setup: repo Settings > Environments > add 'self-hosted' with
+# yourself as required reviewer. Register the Windows 10 VM with
+# labels self-hosted + windows (it only needs Rust stable MSVC and
+# Git for Windows). Set the repo secret WINDOWS_RUNNER_SECRET (value
+# must match EXPECTED_SECRET below).
 #
-# Releasing: push a semver tag (e.g. 1.2.0 or v1.2.0), or dispatch with
-# release_tag. Manual dispatches can pick the Linux distro via
-# linux_runner; tag pushes and PRs use ubuntu-latest. For the best
-# binary compatibility pick the OLDEST distro you care about - the
-# binary is glibc-linked, so it runs on that distro and anything newer.
+# prepare-release uses the repo-scoped concurrency group
+# 'release-prepare' so this workflow and linux-release.yml cannot
+# race into creating the same release twice.
 
 "on":
   push:
@@ -42,23 +45,15 @@ name: Release
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Release tag to build/attach for (created if missing)
+        description: Release tag to attach the exe to (created if missing)
         required: true
         type: string
-      linux_runner:
-        description: Runner/distro for the Linux build
-        type: choice
-        default: ubuntu-latest
-        options:
-          - ubuntu-latest
-          - ubuntu-24.04
-          - ubuntu-22.04
 
 permissions:
   contents: write
 
 concurrency:
-  group: release
+  group: windows-release
 
 jobs:
   scan:
@@ -117,73 +112,6 @@ jobs:
             exit 1
           fi
           echo "created release for $TAG"
-
-  build-linux:
-    name: Build + attach Linux
-    runs-on: ${{ github.event.inputs.linux_runner || 'ubuntu-latest' }}
-    needs: [scan, prepare-release]
-    if: github.repository == 'giacomoguiduzzi/yara'
-    environment: self-hosted
-    env:
-      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      INPUT_RELEASE_TAG: ${{ github.event.inputs.release_tag }}
-    steps:
-      # actions/checkout v4.4.0
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Build release binary
-        run: |
-          cargo build --release
-          test -x target/release/yara
-          # first launch runs the config wizard; headless runners take
-          # the graceful fallback, so this is safe without a display
-          ./target/release/yara > /dev/null
-          echo "built and smoke-tested target/release/yara"
-      - name: Attach to release
-        if: github.event_name != 'pull_request'
-        run: |
-          if [ -n "$INPUT_RELEASE_TAG" ]; then
-            TAG="$INPUT_RELEASE_TAG"
-          else
-            TAG="$GITHUB_REF_NAME"
-          fi
-          asset="yara-$TAG-linux"
-          api=https://api.github.com
-          auth="token $GH_TOKEN"
-          rel=$(curl -sf -H "Authorization: $auth" \
-            "$api/repos/$GITHUB_REPOSITORY/releases/tags/$TAG")
-          # asset uploads live on uploads.github.com; the release
-          # object's upload_url points at the live route (the legacy
-          # api.github.com .../releases/{id}/assets POST now 404s)
-          base=$(printf '%s' "$rel" | jq -r '.upload_url')
-          base=${base%%\{*}
-          # idempotent: drop any previous asset with the same name
-          old=$(printf '%s' "$rel" | jq -r --arg n "$asset" \
-            '.assets[]? | select(.name == $n) | .id')
-          if [ -n "$old" ] && [ "$old" != "null" ]; then
-            curl -sf -X DELETE -H "Authorization: $auth" \
-              "$api/repos/$GITHUB_REPOSITORY/releases/assets/$old"
-          fi
-          out=$(curl -sS -w '\nHTTP:%{http_code}' -X POST \
-            -H "Authorization: $auth" \
-            -H 'Content-Type: application/octet-stream' \
-            --data-binary "@target/release/yara" \
-            "$base?name=$asset&label=Linux")
-          # the -w trailer is the last line; the JSON body may
-          # incidentally contain "201", so match the exact line
-          status=$(printf '%s' "$out" | tail -n 1)
-          if [ "$status" != "HTTP:201" ]; then
-            echo "asset upload failed:"
-            printf '%s\n' "$out"
-            exit 1
-          fi
-          # verify the asset is visible on the release
-          check=$(curl -sf -H "Authorization: $auth" \
-            "$api/repos/$GITHUB_REPOSITORY/releases/tags/$TAG")
-          printf '%s' "$check" | jq -e --arg n "$asset" \
-            '.assets[]? | select(.name == $n)' > /dev/null
-          echo "attached $asset to release $TAG"
 
   build-windows:
     name: Build + attach Windows (self-hosted)
@@ -262,7 +190,7 @@ jobs:
             $payload = @{
               tag_name = $tag
               name = "yara $tag"
-              body = 'Built by the unified release pipeline.'
+              body = 'Built by the release pipeline.'
             } | ConvertTo-Json
             # join to one string: multi-line output is an array in
             # PowerShell, and -notmatch on an array FILTERS it, so the

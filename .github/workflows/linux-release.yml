@@ -1,0 +1,185 @@
+name: Linux release
+
+# Linux half of the release pipeline (the Windows half is
+# windows-release.yml, with the same scan + prepare + build shape).
+#
+# One file per platform so each platform gets its own workflow name
+# and therefore its own README badge label - the native badge label
+# is always the workflow name and cannot be overridden. Trade-off vs
+# a single unified workflow: a release runs the scan twice and asks
+# for two environment approvals (one per platform).
+#
+# Releasing: push a semver tag (both workflows run and both platforms
+# build), or dispatch this workflow (and windows-release.yml) with
+# release_tag. The distro dropdown lets you pick the Linux runner;
+# tag pushes and PRs use ubuntu-latest. For the best binary
+# compatibility pick the OLDEST distro you care about - the binary is
+# glibc-linked, so it runs on that distro and anything newer.
+#
+# Security model (defense in depth against untrusted PR code):
+#   1. Trigger guard: jobs only run for this exact repo (job 'if').
+#   2. Manual approval: the build job uses the 'self-hosted'
+#      environment; with required reviewers set, nothing runs on a
+#      non-free runner until a human approves the run.
+#   3. Security scan: 'cargo audit' runs on a GitHub-hosted runner
+#      against the exact code that would be built, before the build
+#      job is allowed to start.
+#   4. PR runs never create or modify releases: the attach step is
+#      skipped and fork PR tokens are read-only.
+#
+# Setup: repo Settings > Environments > add 'self-hosted' with
+# yourself as required reviewer.
+#
+# prepare-release uses the repo-scoped concurrency group
+# 'release-prepare' so this workflow and windows-release.yml cannot
+# race into creating the same release twice.
+
+"on":
+  push:
+    tags: ['v*.*.*', '*.*.*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag to build/attach for (created if missing)
+        required: true
+        type: string
+      linux_runner:
+        description: Runner/distro for the Linux build
+        type: choice
+        default: ubuntu-latest
+        options:
+          - ubuntu-latest
+          - ubuntu-24.04
+          - ubuntu-22.04
+
+permissions:
+  contents: write
+
+concurrency:
+  group: linux-release
+
+jobs:
+  scan:
+    name: Security scan (free runner)
+    runs-on: ubuntu-latest
+    if: github.repository == 'giacomoguiduzzi/yara'
+    steps:
+      # actions/checkout v4.4.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
+
+  prepare-release:
+    name: Prepare release (free runner)
+    runs-on: ubuntu-latest
+    needs: [scan]
+    # only meaningful when a tag is known (dispatch or tag push)
+    if: >-
+      github.repository == 'giacomoguiduzzi/yara' &&
+      (github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'push' && github.ref_type == 'tag'))
+    concurrency:
+      group: release-prepare
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      INPUT_RELEASE_TAG: ${{ github.event.inputs.release_tag }}
+    steps:
+      - name: Ensure release exists for the tag
+        run: |
+          if [ -n "$INPUT_RELEASE_TAG" ]; then
+            TAG="$INPUT_RELEASE_TAG"
+          else
+            TAG="$GITHUB_REF_NAME"
+          fi
+          api=https://api.github.com
+          auth="token $GH_TOKEN"
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "Authorization: $auth" \
+            "$api/repos/$GITHUB_REPOSITORY/releases/tags/$TAG")
+          if [ "$code" = "200" ]; then
+            echo "release for $TAG already exists"
+            exit 0
+          fi
+          payload=$(printf '{"tag_name":"%s","name":"yara %s"}' \
+            "$TAG" "$TAG")
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+            -H "Authorization: $auth" \
+            -H 'Content-Type: application/json' \
+            --data "$payload" \
+            "$api/repos/$GITHUB_REPOSITORY/releases")
+          if [ "$code" != "201" ]; then
+            echo "release creation failed: HTTP $code" >&2
+            exit 1
+          fi
+          echo "created release for $TAG"
+
+  build-linux:
+    name: Build + attach Linux
+    runs-on: ${{ github.event.inputs.linux_runner || 'ubuntu-latest' }}
+    needs: [scan, prepare-release]
+    if: github.repository == 'giacomoguiduzzi/yara'
+    environment: self-hosted
+    env:
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      INPUT_RELEASE_TAG: ${{ github.event.inputs.release_tag }}
+    steps:
+      # actions/checkout v4.4.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release binary
+        run: |
+          cargo build --release
+          test -x target/release/yara
+          # first launch runs the config wizard; headless runners take
+          # the graceful fallback, so this is safe without a display
+          ./target/release/yara > /dev/null
+          echo "built and smoke-tested target/release/yara"
+      - name: Attach to release
+        if: github.event_name != 'pull_request'
+        run: |
+          if [ -n "$INPUT_RELEASE_TAG" ]; then
+            TAG="$INPUT_RELEASE_TAG"
+          else
+            TAG="$GITHUB_REF_NAME"
+          fi
+          asset="yara-$TAG-linux"
+          api=https://api.github.com
+          auth="token $GH_TOKEN"
+          rel=$(curl -sf -H "Authorization: $auth" \
+            "$api/repos/$GITHUB_REPOSITORY/releases/tags/$TAG")
+          # asset uploads live on uploads.github.com; the release
+          # object's upload_url points at the live route (the legacy
+          # api.github.com .../releases/{id}/assets POST now 404s)
+          base=$(printf '%s' "$rel" | jq -r '.upload_url')
+          base=${base%%\{*}
+          # idempotent: drop any previous asset with the same name
+          old=$(printf '%s' "$rel" | jq -r --arg n "$asset" \
+            '.assets[]? | select(.name == $n) | .id')
+          if [ -n "$old" ] && [ "$old" != "null" ]; then
+            curl -sf -X DELETE -H "Authorization: $auth" \
+              "$api/repos/$GITHUB_REPOSITORY/releases/assets/$old"
+          fi
+          out=$(curl -sS -w '\nHTTP:%{http_code}' -X POST \
+            -H "Authorization: $auth" \
+            -H 'Content-Type: application/octet-stream' \
+            --data-binary "@target/release/yara" \
+            "$base?name=$asset&label=Linux")
+          # the -w trailer is the last line; the JSON body may
+          # incidentally contain "201", so match the exact line
+          status=$(printf '%s' "$out" | tail -n 1)
+          if [ "$status" != "HTTP:201" ]; then
+            echo "asset upload failed:"
+            printf '%s\n' "$out"
+            exit 1
+          fi
+          # verify the asset is visible on the release
+          check=$(curl -sf -H "Authorization: $auth" \
+            "$api/repos/$GITHUB_REPOSITORY/releases/tags/$TAG")
+          printf '%s' "$check" | jq -e --arg n "$asset" \
+            '.assets[]? | select(.name == $n)' > /dev/null
+          echo "attached $asset to release $TAG"
