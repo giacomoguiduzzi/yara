@@ -2,11 +2,11 @@ name: ComfyUI e2e tests
 
 # Runs the committed end-to-end suite (.comfytest/tests/run_tests.sh) against
 # both current ComfyUI docker images, on GitHub-hosted CPU runners.
-on:
-  push:
-    branches: [main]
-    tags: ['v*.*.*', '*.*.*']
-  pull_request:
+#
+# MANUAL ONLY (workflow_dispatch): each run is ~2 x ~75 min of CPU on
+# GitHub-hosted runners, which would exhaust the fork's free minutes if it
+# ran on every push/tag/PR. Run it explicitly from the Actions tab.
+"on":
   workflow_dispatch:
 
 concurrency:

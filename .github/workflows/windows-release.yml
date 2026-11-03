@@ -144,10 +144,13 @@ jobs:
               name = "yara $tag (Windows)"
               body = 'Built on a self-hosted Windows 10 runner.'
             } | ConvertTo-Json
-            $created = curl.exe -s -S -w '\nHTTP:%{http_code}' `
+            # join to one string: multi-line output is an array in
+            # PowerShell, and -notmatch on an array FILTERS it, so the
+            # JSON body line alone would make the if-branch fire.
+            $created = (curl.exe -s -S -w '\nHTTP:%{http_code}' `
               -X POST -H "Authorization: $auth" `
               -H 'Content-Type: application/json' --data $payload `
-              "$api/repos/$repo/releases"
+              "$api/repos/$repo/releases") -join "`n"
             if ($created -notmatch 'HTTP:201') {
               throw "Release creation failed:`n$created"
             }
@@ -169,11 +172,11 @@ jobs:
           # PowerShell reads $uploadBase?name as ONE variable name
           # (the ? is absorbed), yielding an empty host for curl.
           $uploadUrl = $uploadBase + '?name=yara.exe' + '&label=Windows'
-          $upload = curl.exe -s -S -w '\nHTTP:%{http_code}' `
+          $upload = (curl.exe -s -S -w '\nHTTP:%{http_code}' `
             -X POST -H "Authorization: $auth" `
             -H 'Content-Type: application/octet-stream' `
             --data-binary "@$exe" `
-            $uploadUrl
+            $uploadUrl) -join "`n"
           if ($upload -notmatch 'HTTP:201') {
             throw "Asset upload failed:`n$upload"
           }
