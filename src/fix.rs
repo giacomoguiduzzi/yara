@@ -13,6 +13,9 @@ const API_DATA_MARKER: [u8; 10] = [116, 69, 88, 116, 112, 114, 111, 109, 112, 11
 
 
 fn save_hash_and_workflow(x: &YaraPrompt, workflow_file: &str, storage: &mut WorkflowStorage) {
+    // Prompts saved without workflow metadata (e.g. enqueued via the API) have
+    // nothing to store, and storing null would cause it to be embedded.
+    if x.workflow.is_null() { return; }
     storage.workflows.insert(x.hash.clone(), x.workflow.clone());
     fs::write(workflow_file, serde_json::to_string_pretty(&storage).unwrap()).unwrap();
 }

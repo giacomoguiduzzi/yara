@@ -261,6 +261,7 @@ fn save_queue(arg: String, cmd: SaveQueue, ip_port: String, workflow_storage: &W
 
     let mut prompts: Vec<YaraPrompt> = Vec::new();
     let mut successes = 0;
+    let mut no_workflow = 0;
     let mut failures = 0;
 
     // The ComfyUI frontend sends the workflow metadata alongside each prompt. As a
@@ -298,8 +299,13 @@ fn save_queue(arg: String, cmd: SaveQueue, ip_port: String, workflow_storage: &W
                         successes += 1;
                     }
                     None => {
-                        println!("\x1b[31merror\x1b[0m:// failed to save prompt number {} (could not get workflow metadata).", p[0]);
-                        failures += 1;
+                        // Prompt has no workflow metadata (common for prompts
+                        // enqueued via the API). Save it anyway so it can be
+                        // re-queued; yara fix/regen just won't apply to it.
+                        println!("\x1b[33mnote\x1b[0m:// prompt number {} has no workflow metadata; saved without a workflow.", p[0]);
+                        no_workflow += 1;
+                        successes += 1;
+                        prompts.push(YaraPrompt::new(prompt, Value::Null, &ip_port));
                     }
                 }
             }
@@ -319,8 +325,13 @@ fn save_queue(arg: String, cmd: SaveQueue, ip_port: String, workflow_storage: &W
                     successes += 1;
                 }
                 None => {
-                    println!("\x1b[31merror\x1b[0m:// failed to save prompt number {} (could not get workflow metadata).", p[0]);
-                    failures += 1;
+                    println!("\x1b[33mnote\x1b[0m:// prompt number {} has no workflow metadata; saved without a workflow.", p[0]);
+                    no_workflow += 1;
+                    successes += 1;
+                    ordered_prompts.push((
+                        p[0].as_i64().unwrap(),
+                        YaraPrompt::new(prompt, Value::Null, &ip_port)
+                    ));
                 }
             }
         }
@@ -329,7 +340,7 @@ fn save_queue(arg: String, cmd: SaveQueue, ip_port: String, workflow_storage: &W
     let (_, x): (Vec<i64>, Vec<YaraPrompt>) = ordered_prompts.iter().cloned().unzip();
     prompts.extend(x);
 
-    println!("{successes} prompts saved. {failures} prompts attempted to save but failed due to no workflow metadata");
+    println!("{successes} prompts saved ({no_workflow} without workflow metadata). {failures} prompts attempted to save but failed");
 
     if successes > 0 {
         let path = get_saved_queue_path(arg);
@@ -454,14 +465,20 @@ fn examine_queue(ip_port: String) {
 }
 
 
-// Node references in prompt maps are usually numeric strings ("5"), but can
-// also be numbers depending on the client. Accept both.
-fn node_ref_id(v: &Value) -> Option<u64> {
+// A node id inside a prompt map. The frontend uses numeric strings ("5"), but
+// the ComfyUI API accepts arbitrary string node ids, so keep them as strings.
+fn node_ref_id(v: &Value) -> Option<String> {
     match v {
-        Value::Number(n) => n.as_u64(),
-        Value::String(s) => s.parse::<u64>().ok(),
+        Value::Number(n) => n.as_u64().map(|x| x.to_string()),
+        Value::String(s) => Some(s.clone()),
         _ => None,
     }
+}
+
+// A link reference is a two-element array ["nodeid", slot]; return the node
+// id. Plain values (e.g. a literal text string) are not links.
+fn link_target(input: &Value) -> Option<String> {
+    input.as_array().and_then(|a| a.first()).and_then(node_ref_id)
 }
 
 
@@ -471,25 +488,23 @@ fn get_prompt_info(p: &Value) -> Option<PromptInfo> {
 
     // println!("Queue ID: {queue_id}");
 
-    let mut nodemap: HashMap<u64, Value> = HashMap::new();
-    let mut sampler_id: Option<u64> = None;
-    for n in nodes {
-        if (n.1["class_type"] == "KSampler") | (n.1["class_type"] == "KSamplerAdvanced") | (n.1["class_type"] == "SamplerCustom") {
-            sampler_id = n.0.to_string().parse::<u64>().ok();
+    let mut nodemap: HashMap<String, Value> = HashMap::new();
+    let mut sampler_id: Option<String> = None;
+    for (id, node) in nodes {
+        if (node["class_type"] == "KSampler") | (node["class_type"] == "KSamplerAdvanced") | (node["class_type"] == "SamplerCustom") {
+            sampler_id = Some(id.clone());
         }
-        if let Ok(id) = n.0.to_string().parse::<u64>() {
-            nodemap.insert(id, n.1.clone());
-        }
+        nodemap.insert(id.clone(), node.clone());
     }
     // Prompts with no sampler node (e.g. from custom nodes) have nothing to show.
     let sampler_id = sampler_id?;
 
     // Get models (lora -> ... -> lora -> model)
-    let mut curr_node_id: u64 = sampler_id;
-    let mut visited: HashSet<u64> = HashSet::new();
+    let mut curr_node_id: String = sampler_id.clone();
+    let mut visited: HashSet<String> = HashSet::new();
     let mut models: Vec<String> = Vec::new();
     loop {
-        if !visited.insert(curr_node_id) { break; }
+        if !visited.insert(curr_node_id.clone()) { break; }
         let Some(curr_node) = nodemap.get(&curr_node_id) else { break; };
         if curr_node["class_type"] == "LoraLoader" {
             let mut name = curr_node["inputs"]["lora_name"].to_string();
@@ -508,7 +523,7 @@ fn get_prompt_info(p: &Value) -> Option<PromptInfo> {
             models.push(name);
         }
 
-        match curr_node["inputs"].get("model").and_then(|m| node_ref_id(&m[0])) {
+        match curr_node["inputs"].get("model").and_then(link_target) {
             Some(id) => curr_node_id = id,
             None => break,
         }
@@ -516,12 +531,12 @@ fn get_prompt_info(p: &Value) -> Option<PromptInfo> {
     // println!("models: {models:?}");
 
     // Get positive prompt
-    let mut curr_node_id: u64 = sampler_id;
-    let mut visited: HashSet<u64> = HashSet::new();
+    let mut curr_node_id: String = sampler_id;
+    let mut visited: HashSet<String> = HashSet::new();
     let mut p_prompt = String::new();
     // TO-DO: Refactor this section
     loop {
-        if !visited.insert(curr_node_id) { break; }
+        if !visited.insert(curr_node_id.clone()) { break; }
         let Some(curr_node) = nodemap.get(&curr_node_id) else { break; };
         if curr_node["class_type"] == "PromptText" {
             p_prompt = curr_node["inputs"]["text"].to_string();
@@ -529,7 +544,7 @@ fn get_prompt_info(p: &Value) -> Option<PromptInfo> {
         }
         if curr_node["class_type"] == "CLIPTextEncode" {
             if let Some(text) = curr_node["inputs"].get("text") {
-                match node_ref_id(&text[0]) {
+                match link_target(text) {
                     Some(id) => curr_node_id = id, // text is a link to another node
                     None => {
                         p_prompt = text.to_string();
@@ -540,10 +555,10 @@ fn get_prompt_info(p: &Value) -> Option<PromptInfo> {
                 break;
             }
         }
-        else if let Some(id) = curr_node["inputs"].get("positive").and_then(|m| node_ref_id(&m[0])) {
+        else if let Some(id) = curr_node["inputs"].get("positive").and_then(link_target) {
             curr_node_id = id;
         }
-        else if let Some(id) = curr_node["inputs"].get("conditioning").and_then(|m| node_ref_id(&m[0])) {
+        else if let Some(id) = curr_node["inputs"].get("conditioning").and_then(link_target) {
             curr_node_id = id;
         }
         else {
@@ -597,11 +612,11 @@ fn wait_to_end(ip_port: String) {
 }
 
 
-// Return ID of the node going into this input field
-fn get_input_node_id(node: &Value, field: &str) -> String {
-    let x = &mut node["inputs"].as_object().unwrap()[field][0].to_string();
-    x.retain(|c| ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-'].contains(&c));
-    x.parse::<usize>().unwrap().to_string()
+// Return the id of the node feeding this input field, if the field is a link
+// reference (["nodeid", slot]). Node ids may be arbitrary strings.
+fn get_input_node_id(node: &Value, field: &str) -> Option<String> {
+    let input = node.get("inputs")?.as_object()?.get(field)?;
+    link_target(input)
 }
 
 
@@ -658,30 +673,35 @@ fn image_generation_info() -> ImageGenInteractive {
 
 
     // Follow conditioning from Sampler until you reach Text
-    fn push_preceding_text(nodes: &Map<String, Value>, mut id: String, prompts: &mut Vec<String>, controlnets: &mut Vec<String>) {
+    fn push_preceding_text(nodes: &Map<String, Value>, mut id: Option<String>, prompts: &mut Vec<String>, controlnets: &mut Vec<String>) {
         for _ in 0..nodes.len() {
-            let target = nodes.get(&id.to_string()).unwrap();
+            let Some(target) = id.as_ref().and_then(|i| nodes.get(i)) else { return; };
             match target["class_type"].as_str() {
                 Some("PromptText") => {
-                    prompts.push("\n".to_string() + &target["inputs"].as_object().unwrap()["text"].as_str().unwrap().to_string());
+                    if let Some(text) = target["inputs"].get("text").and_then(|t| t.as_str()) {
+                        prompts.push("\n".to_string() + text);
+                    }
                     return;
                 }
                 Some("CLIPTextEncode")  => {
-                    match target["inputs"].as_object().unwrap()["text"].as_str() {
+                    match target["inputs"].get("text").and_then(|t| t.as_str()) {
                         Some(x) => {
                             prompts.push("\n".to_string() + &x.to_string());
                             return;
                         }
                         None => {
-                            target["inputs"].as_object().unwrap();
                             id = get_input_node_id(target, "text");
                         }
                     }
                 }
                 Some("ControlNetApply") => {
-                    let cid = get_input_node_id(target, "control_net");
-                    let controlnet_target = nodes.get(&cid.to_string()).unwrap();
-                    controlnets.push(controlnet_target["inputs"].as_object().unwrap()["control_net_name"].as_str().unwrap().to_string());
+                    if let Some(cid) = get_input_node_id(target, "control_net") {
+                        if let Some(cn) = nodes.get(&cid) {
+                            if let Some(name) = cn["inputs"].get("control_net_name").and_then(|v| v.as_str()) {
+                                controlnets.push(name.to_string());
+                            }
+                        }
+                    }
                     id = get_input_node_id(target, "conditioning");
                 }
                 _ => {
@@ -689,20 +709,24 @@ fn image_generation_info() -> ImageGenInteractive {
                 }
             }
         }
-        panic!("Failed to find the originating node for a sampler's input positive/negative text");
+        // Couldn't resolve this branch to a text node; report what was found.
     }
 
     // Follow model from Sampler, accumulating loras and the model at the end
-    fn push_preceding_models(nodes: &Map<String, Value>, mut id: String, loras: &mut Vec<String>, models: &mut Vec<String>) {
+    fn push_preceding_models(nodes: &Map<String, Value>, mut id: Option<String>, loras: &mut Vec<String>, models: &mut Vec<String>) {
         for _ in 0..nodes.len() {
-            let target = nodes.get(&id.to_string()).unwrap();
+            let Some(target) = id.as_ref().and_then(|i| nodes.get(i)) else { return; };
             match target["class_type"].as_str() {
                 Some("CheckpointLoaderSimple") | Some("CheckpointLoader") => {
-                    models.push(target["inputs"].as_object().unwrap()["ckpt_name"].as_str().unwrap().to_string());
+                    if let Some(name) = target["inputs"].get("ckpt_name").and_then(|v| v.as_str()) {
+                        models.push(name.to_string());
+                    }
                     return;
                 }
                 Some("LoraLoader") => {
-                    loras.push(target["inputs"].as_object().unwrap()["lora_name"].as_str().unwrap().to_string());
+                    if let Some(name) = target["inputs"].get("lora_name").and_then(|v| v.as_str()) {
+                        loras.push(name.to_string());
+                    }
                     id = get_input_node_id(target, "model");
                 }
                 _ => {
@@ -710,7 +734,7 @@ fn image_generation_info() -> ImageGenInteractive {
                 }
             }
         }
-        panic!("Failed to find the originating node for a sampler's input positive/negative text");
+        // Couldn't resolve this branch to a model node; report what was found.
     }
 
 

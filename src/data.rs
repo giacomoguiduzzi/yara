@@ -107,7 +107,7 @@ pub fn fetch_json(url: &str) -> Value {
 
 #[derive(Debug)]
 struct Node {
-    id: u64,
+    id: String,
     contents: Value,
 }
 
@@ -117,8 +117,13 @@ fn get_field(mut bytes: &mut Vec<u8>, input: &Value) {
     } else if let Some(field) = input.as_str() {
         bytes.extend(field.bytes());
     } else if let Some(array) = input.as_array() {
-        get_field(&mut bytes, &array[0]);
-        get_field(&mut bytes, &array[1]);
+        // Link references are ["nodeid", slot]; hash whatever is present
+        if let Some(first) = array.first() {
+            get_field(&mut bytes, first);
+        }
+        if array.len() > 1 {
+            get_field(&mut bytes, &array[1]);
+        }
     } else {
         println!("Warning - while hashing nodes, unexpected input");
         bytes.extend(input.to_string().bytes());
@@ -130,17 +135,30 @@ impl Node {
     // Note that we can't just hash it directly, because it seems ComfyUI randomly
     // changes parts of the prompt (e.g. node ordering, or turning a float into an integer)
     fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes: Vec<u8> = Vec::from(self.id.to_be_bytes());
+        let mut bytes: Vec<u8> = Vec::new();
+        // Numeric node ids are hashed exactly as before (8 big-endian bytes)
+        // so saved queues and workflow storage keep matching; the ComfyUI API
+        // also accepts arbitrary string node ids, which get a 0xFF-prefixed
+        // string encoding that cannot collide with a numeric id.
+        match self.id.parse::<u64>() {
+            Ok(n) => bytes.extend(n.to_be_bytes()),
+            Err(_) => {
+                bytes.push(0xFF);
+                bytes.extend(self.id.as_bytes());
+            }
+        }
 
-        let class_type = self.contents.get("class_type").unwrap().as_str().unwrap();
+        let class_type = self.contents.get("class_type").and_then(|v| v.as_str()).unwrap_or("");
         bytes.extend(class_type.as_bytes());
 
-        let inputs = self.contents.get("inputs").unwrap().as_object().unwrap();
-        let mut keys: Vec<String> = inputs.keys().map(|x| x.to_string()).collect(); // sort this alphabetically
-        keys.sort();
-        for key in keys {
-            let input = inputs.get(&key).unwrap();
-            get_field(&mut bytes, input);
+        if let Some(inputs) = self.contents.get("inputs").and_then(|i| i.as_object()) {
+            let mut keys: Vec<String> = inputs.keys().map(|x| x.to_string()).collect(); // sort this alphabetically
+            keys.sort();
+            for key in keys {
+                if let Some(input) = inputs.get(&key) {
+                    get_field(&mut bytes, input);
+                }
+            }
         }
 
         bytes
@@ -150,17 +168,73 @@ impl Node {
 pub fn hash_nodemap(nodemap: &serde_json::Map<String, Value>) -> String {
 
     let mut nodes: Vec<Node> = Vec::new();
-    for id in nodemap.keys() {
+    for (id, contents) in nodemap.iter() {
         nodes.push(Node {
-            id: id.parse::<u64>().unwrap(),
-            contents: nodemap.get(id).unwrap().clone(),
+            id: id.clone(),
+            contents: contents.clone(),
         });
     }
-    nodes.sort_by(|a, b| a.id.partial_cmp(&b.id).unwrap()); 
+    // Numeric node ids come first (ascending, the original order, so hashes of
+    // numeric prompts are unchanged), then non-numeric ids alphabetically.
+    nodes.sort_by(|a, b| match (a.id.parse::<u64>(), b.id.parse::<u64>()) {
+        (Ok(x), Ok(y)) => x.cmp(&y),
+        (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+        (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+        (Err(_), Err(_)) => a.id.cmp(&b.id),
+    });
 
     let mut hasher = blake3::Hasher::new();
     for node in nodes {
         hasher.update(&node.to_bytes());
     }
     hasher.finalize().to_hex().as_str().to_string()
+}
+#[cfg(test)]
+mod tests {
+    use super::hash_nodemap;
+    use serde_json::json;
+
+    // This nodemap has only numeric node ids. Its hash must equal the one
+    // produced by the pre-1.1.1 algorithm (id 8-byte BE + class_type + sorted
+    // inputs), so previously saved queues and workflow storage keep matching.
+    #[test]
+    fn hash_numeric_compat() {
+        let m = json!({
+            "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "v1-5-pruned.safetensors"}},
+            "2": {"class_type": "KSampler", "inputs": {"model": ["1", 0], "seed": 42, "steps": 20,
+                  "cfg": 7.5, "sampler_name": "euler", "scheduler": "normal", "positive": ["3", 0],
+                  "negative": ["4", 0], "latent_image": ["5", 0], "denoise": 1.0}},
+            "3": {"class_type": "CLIPTextEncode", "inputs": {"text": "a cat sitting", "clip": ["1", 1]}},
+            "4": {"class_type": "CLIPTextEncode", "inputs": {"text": "bad stuff", "clip": ["1", 1]}},
+            "5": {"class_type": "EmptyLatentImage", "inputs": {"width": 512, "height": 512, "batch_size": 1}},
+            "6": {"class_type": "VAEDecode", "inputs": {"samples": ["2", 0], "vae": ["1", 2]}},
+            "7": {"class_type": "SaveImage", "inputs": {"filename_prefix": "test", "images": ["6", 0], "title": "Save"}},
+        });
+        let nodemap = m.as_object().unwrap();
+        assert_eq!(
+            hash_nodemap(nodemap),
+            "8b2ce8cba5d5210ea4ab2f74bcf3e87cd20f420018d93f58b6c9101f32d235a9"
+        );
+    }
+
+    // Non-numeric node ids (the ComfyUI API accepts them) must not panic and
+    // must be deterministic, and different ids must not collide.
+    #[test]
+    fn hash_non_numeric_ids() {
+        let m1 = json!({
+            "loader": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "x.safetensors"}},
+            "sampler": {"class_type": "KSampler", "inputs": {"model": ["loader", 0], "seed": 1}},
+            "pos": {"class_type": "CLIPTextEncode", "inputs": {"text": "hi", "clip": ["loader", 1]}},
+        });
+        let m2 = json!({
+            "loader": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "x.safetensors"}},
+            "sampler": {"class_type": "KSampler", "inputs": {"model": ["loader", 0], "seed": 1}},
+            "pos ": {"class_type": "CLIPTextEncode", "inputs": {"text": "hi", "clip": ["loader", 1]}},
+        });
+        let h1 = hash_nodemap(m1.as_object().unwrap());
+        let h1b = hash_nodemap(m1.as_object().unwrap());
+        let h2 = hash_nodemap(m2.as_object().unwrap());
+        assert_eq!(h1, h1b);
+        assert_ne!(h1, h2);
+    }
 }
