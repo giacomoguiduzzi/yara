@@ -247,6 +247,6 @@ Some of the commands can be shortened, for convenience:
 
 If you have an issue, question, or request for some feature/config option, feel free to make an issue or message me.
 
-This is developed mainly with Windows in mind, but this fork is built and tested on Linux as well (the sleep mode toggles are Windows-only, and print a notice on Linux).
+This was developed mainly with Windows in mind, but this fork is built and tested on Linux as well (the sleep mode toggles are Windows-only, and print a notice on Linux - for now).
 
 This fork is tested against ComfyUI 0.42.x (October 2026) and remains compatible with older versions. If a future ComfyUI release changes the API, parts of this program may break; check the releases page for updates.
